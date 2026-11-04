@@ -147,9 +147,17 @@ def _crew_config() -> dict:
 def _crew_model_context(model: str) -> int:
     """Context window KiroCrew recorded for this model, or 0 when it has none.
 
-    KSWA's ``/v1/models`` carries no context field, so without this table the
-    constructor value always won and the usage meter could be off by the ratio
-    between the two windows.
+    KSWA's ``/v1/models`` carries no context field, so this table
+    (``agent.model_context_tokens``) is the only per-model source there is.
+
+    KiroCrew keys its table by the id the OPERATOR typed, which carries whatever
+    channel prefix that route goes through (``hub-neo/oc/beam-free``,
+    ``regptplus/gpt-6.1-sol``), while the served id we hold may be prefixed
+    differently or not at all. An exact lookup therefore missed every model not
+    spelled identically and fell back to a single global window, which is what made
+    the usage meter report 128K for a model served at 1M. The trailing segment of
+    the id is the model name in every spelling in use, so match on that as well,
+    preferring the id with the most prefix segments in common.
     """
     table = _crew_config().get("model_context_tokens") or {}
     if not isinstance(table, dict):
@@ -158,7 +166,25 @@ def _crew_model_context(model: str) -> int:
         value = table.get(key)
         if isinstance(value, int) and value > 0:
             return value
-    return 0
+    bare = model.rsplit("/", 1)[-1].strip()
+    if not bare:
+        return 0
+    best: tuple[int, int] = (-1, 0)
+    for key, value in table.items():
+        if not isinstance(value, int) or value <= 0:
+            continue
+        if key.rsplit("/", 1)[-1].strip() != bare:
+            continue
+        # Same model name: prefer the entry whose prefix overlaps most with ours,
+        # so an ``oc/`` route picks the ``hub-neo/oc/`` row over the plain one.
+        shared = sum(
+            1
+            for a, b in zip(model.split("/")[:-1], key.split("/")[:-1])
+            if a == b
+        )
+        if shared > best[0]:
+            best = (shared, value)
+    return best[1]
 
 
 def _approval_timeout() -> float:
@@ -250,9 +276,11 @@ class OpenAIProvider(LLMProvider):
 
     async def start(self) -> None:
         self._alive = True
-        # Resolve context window from API if not explicitly overridden
-        if not self._context_window_override:
-            await self._resolve_context_window()
+        # Always resolve: KiroCrew's per-model table outranks the single window this
+        # provider was configured with. Skipping this whenever an override existed is
+        # what pinned EVERY model to one number -- the served model could be a 1M
+        # route while the meter read the provider-wide default.
+        await self._resolve_context_window()
         logger.info(
             "OpenAIProvider started (model=%s, base_url=%s, context_window=%d, max_tokens=%d)",
             self._model, self._base_url, self._context_window, self._max_tokens,
@@ -262,7 +290,8 @@ class OpenAIProvider(LLMProvider):
         """Resolve the model's context window for usage reporting.
 
         Resolution priority:
-          1. Constructor ``context_window`` param (already set in ``__init__``)
+          1. KiroCrew's ``agent.model_context_tokens`` table for THIS model id
+          2. Constructor ``context_window`` param (already set in ``__init__``)
           2. ``OPENAI_CONTEXT_WINDOW`` env var
           3. ``/v1/models`` endpoint (``context_window`` / ``context_length``)
           4. Built-in ``KNOWN_CONTEXT_WINDOWS`` map (exact, then prefix)
@@ -1019,45 +1048,51 @@ class OpenAIProvider(LLMProvider):
 
         # Execute the tool. KiroCrew's tools resolve "which session am I in" through
         # mcp_core._resolve_session_key(): caller context, signed token, then
-        # KIROCREW_SESSION_KEY, then a pid mapping. In-process execution has none of
-        # the first three and no pid of its own, so spawn_run stored an empty
-        # parent_session and the dashboard could not attribute the subagent to any
-        # chat -- the right-hand subagent list stayed empty. Publish the key for the
-        # duration of the call (level 3 of that ladder).
-        _prior_session_key = os.environ.get("KIROCREW_SESSION_KEY")
+        # KIROCREW_SESSION_KEY, then a pid mapping. There is no caller context for a
+        # tool dispatched by this provider, so the identity has to reach the MCP
+        # child in its environment -- the stub servers KiroCrew injects carry it that
+        # way too.
+        #
+        # It rides a contextvar, NOT os.environ. One gateway process serves every
+        # session at once (dashboard chats, subagents, crons), so writing the key
+        # into os.environ let two concurrent tool calls interleave: spawn_run
+        # resolved its parent_session as session A, the gateway then compared the
+        # declared key against a token that session B had just stamped, and the
+        # request was refused ``member_identity_unavailable``. A contextvar is
+        # per-task, and mcp_executor stamps the key+token pair into the child's own
+        # environment at spawn, so the pair a request carries always belongs to the
+        # session whose tool is running.
         _session_key = _live_session_key(self._session_key)
-        _published_session_key = bool(_session_key)
-        if _published_session_key:
-            os.environ["KIROCREW_SESSION_KEY"] = _session_key
         # A bare KIROCREW_SESSION_KEY only *declares* the identity; the gateway
-        # verifies nothing and answers identity_unattested, so every tool that needs
-        # an attested caller (spawn_run, memory_recall, ...) is refused. The attested
-        # path needs a minted stub token published against this session -- that is
-        # what the injected MCP servers normally carry.
-        _token = self._ensure_stub_token(_session_key)
-        _prior_token = os.environ.get(_STUB_TOKEN_ENV)
+        # verifies nothing and answers identity_unattested. The attested path needs
+        # a minted stub token published against this session -- that is what the
+        # injected MCP servers normally carry.
+        _token = self._ensure_stub_token(_session_key) if _session_key else ""
         if _token:
-            os.environ[_STUB_TOKEN_ENV] = _token
             try:
                 from kiro_crew.session_token_sig import publish_session_token
 
                 publish_session_token(_token, _session_key)
             except Exception:  # noqa: BLE001
                 pass
+        _identity_token = None
+        try:
+            from .mcp_executor import set_tool_identity
+
+            _identity_token = set_tool_identity(_session_key, _token)
+        except Exception:  # noqa: BLE001
+            logger.debug("openai_provider: tool identity unavailable", exc_info=True)
         try:
             try:
                 result = await self._tool_executor.execute(fn_name, fn_args)
             finally:
-                if _published_session_key:
-                    if _prior_session_key is None:
-                        os.environ.pop("KIROCREW_SESSION_KEY", None)
-                    else:
-                        os.environ["KIROCREW_SESSION_KEY"] = _prior_session_key
-                if _token:
-                    if _prior_token is None:
-                        os.environ.pop(_STUB_TOKEN_ENV, None)
-                    else:
-                        os.environ[_STUB_TOKEN_ENV] = _prior_token
+                if _identity_token is not None:
+                    try:
+                        from .mcp_executor import reset_tool_identity
+
+                        reset_tool_identity(_identity_token)
+                    except Exception:  # noqa: BLE001
+                        pass
         except Exception as exc:
             result = f"[Tool error: {exc}]"
             logger.exception("Tool %s raised", fn_name)

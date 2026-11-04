@@ -30,6 +30,7 @@ Execution:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import importlib
 import json
 import logging
@@ -40,6 +41,59 @@ from typing import Any
 from .provider import ToolExecutor
 
 logger = logging.getLogger(__name__)
+
+
+# ── Per-call session identity ────────────────────────────────────────────────
+#
+# One gateway process serves MANY sessions at once (dashboard chats, subagents,
+# crons), and the MCP servers are spawned as child processes that must carry the
+# identity of the session whose tool ran. KiroCrew's own ACP path puts that
+# identity in each session's OWN mcpServers env element; we have no element, so
+# the identity has to reach the child some other way.
+#
+# Writing it into os.environ is wrong and was the cause of
+# ``member_identity_unavailable`` / ``identity_unattested``: two sessions running
+# tools concurrently overwrite each other's KIROCREW_SESSION_KEY between the
+# moment spawn_run resolves its parent_session and the moment the gateway
+# verifies the declared key against the signed token, so a request could carry
+# session A's key beside session B's token and be refused. A contextvar is
+# per-task, so concurrent sessions cannot see each other's identity, and the
+# child gets the pair stamped explicitly at spawn time.
+_TOOL_IDENTITY: contextvars.ContextVar[dict[str, str]] = contextvars.ContextVar(
+    "openai_bridge_tool_identity", default={}
+)
+
+
+def set_tool_identity(session_key: str, token: str) -> contextvars.Token:
+    """Bind *session_key* + *token* to the current task for the duration of a tool call."""
+    return _TOOL_IDENTITY.set({"session_key": session_key or "", "token": token or ""})
+
+
+def reset_tool_identity(token: contextvars.Token) -> None:
+    """Unbind the identity :func:`set_tool_identity` installed."""
+    try:
+        _TOOL_IDENTITY.reset(token)
+    except (ValueError, RuntimeError):
+        _TOOL_IDENTITY.set({})
+
+
+def _child_env() -> dict[str, str]:
+    """The environment an MCP child gets: this process's, plus OUR session identity.
+
+    Both variables are written together from the same bound identity, so they can
+    never disagree -- which is exactly what the gateway's attestation compares.
+    Without a bound identity the parent environment is inherited unchanged, so a
+    non-provider caller keeps whatever it had.
+    """
+    env = dict(os.environ)
+    identity = _TOOL_IDENTITY.get() or {}
+    key = identity.get("session_key") or ""
+    token = identity.get("token") or ""
+    if key:
+        env["KIROCREW_SESSION_KEY"] = key
+    if token:
+        env["KIROCREW_STUB_SESSION_TOKEN"] = token
+    return env
 
 
 # ── Managed server tool discovery (in-process, no spawn) ─────────────────────
@@ -140,6 +194,7 @@ async def _probe_server_tools(server) -> list[dict]:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=_child_env(),
         )
 
         # Send initialize request
@@ -260,6 +315,7 @@ async def _execute_via_mcp_stdio(
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=_child_env(),
         )
 
         # Initialize
