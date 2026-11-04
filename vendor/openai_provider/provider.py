@@ -172,6 +172,12 @@ _CATALOG_PATH = os.path.join(
 )
 _CATALOG_CACHE: tuple[float, dict] = (0.0, {})
 
+#: Models the gateway itself advertises, cached briefly. Separate from the file
+#: catalog above: that one says what a model can do, this one says which models
+#: exist right now, and only the gateway knows the second.
+_AVAILABLE_CACHE: tuple[float, list] = (0.0, [])
+_AVAILABLE_TTL = 60.0
+
 
 def _catalog() -> dict:
     """Return ``{model_id: entry}`` from the hub-neo catalog, cached by mtime.
@@ -593,6 +599,57 @@ class OpenAIProvider(LLMProvider):
 
     def context_window_tokens(self) -> int:
         return self._context_window or self._max_tokens
+
+    def available_models(self) -> list[dict[str, str]]:
+        """The models the gateway actually serves, for KiroCrew's picker.
+
+        Without this the picker falls back to a catalog from elsewhere, which is
+        how a pick could name a model the gateway does not have -- and such a pick
+        is answered by the gateway's DEFAULT model, i.e. the UI says one thing and
+        another model answers.
+
+        Ids carry the ``hub-neo/`` prefix KiroCrew routes through this provider;
+        ``_bare_model`` strips it again on the way out to the wire.
+
+        Synchronous by design: the callers are sync accessors, the listener is
+        local, and a stale answer beats blocking a request handler on a retry.
+        """
+        global _AVAILABLE_CACHE
+        now = time.time()
+        stamped, cached = _AVAILABLE_CACHE
+        if stamped and now - stamped < _AVAILABLE_TTL and cached:
+            return cached
+        rows: list[dict[str, str]] = []
+        try:
+            import urllib.request
+
+            req = urllib.request.Request(
+                f"{self._base_url}/models",
+                headers={
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Accept": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=3) as resp:  # noqa: S310 - local gateway
+                payload = json.loads(resp.read(4 << 20).decode("utf-8", "replace")) or {}
+            for row in payload.get("data") or []:
+                if not isinstance(row, dict):
+                    continue
+                mid = str(row.get("id") or "").strip()
+                # ``decision`` rows are router internals, not chat models; listing
+                # them only offers the user a pick that cannot answer.
+                if not mid or row.get("decision"):
+                    continue
+                rows.append({"modelId": _MODEL_PREFIX + mid, "name": str(row.get("name") or mid)})
+        except Exception:  # noqa: BLE001
+            # Gateway unreachable: keep the last good answer rather than emptying
+            # the picker, and seed from the file catalog if there has never been one.
+            if cached:
+                return cached
+            return [{"modelId": _MODEL_PREFIX + k, "name": k} for k in sorted(_catalog())]
+        if rows:
+            _AVAILABLE_CACHE = (now, rows)
+        return rows or cached
 
     @property
     def served_model(self) -> str:
