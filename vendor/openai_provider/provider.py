@@ -154,6 +154,8 @@ def _approval_is_auto() -> bool:
     return str(_crew_config().get("approval_mode") or "").lower() in ("auto", "yolo", "bypass")
 
 
+_STUB_TOKEN_ENV = "KIROCREW_STUB_SESSION_TOKEN"
+
 _IMAGES_WARNED = False
 
 
@@ -616,6 +618,22 @@ class OpenAIProvider(LLMProvider):
         if bare:
             self._model = bare
 
+    def _ensure_stub_token(self, session_key: str) -> str:
+        """Mint (once per session key) the stub token that attests this session."""
+        if not session_key:
+            return ""
+        cached = getattr(self, "_stub_token", None)
+        if cached and getattr(self, "_stub_token_key", "") == session_key:
+            return cached
+        try:
+            from kiro_crew.mcp_gateway.claim import mint_stub_session_token
+
+            token = mint_stub_session_token()
+        except Exception:  # noqa: BLE001
+            return ""
+        self._stub_token = token
+        self._stub_token_key = session_key
+        return token
     async def steer(self, message: str) -> bool:
         """Inject a message into the turn that is currently running.
 
@@ -986,9 +1004,25 @@ class OpenAIProvider(LLMProvider):
         # chat -- the right-hand subagent list stayed empty. Publish the key for the
         # duration of the call (level 3 of that ladder).
         _prior_session_key = os.environ.get("KIROCREW_SESSION_KEY")
-        _published_session_key = bool(self._session_key)
+        _session_key = _live_session_key(self._session_key)
+        _published_session_key = bool(_session_key)
         if _published_session_key:
-            os.environ["KIROCREW_SESSION_KEY"] = str(self._session_key)
+            os.environ["KIROCREW_SESSION_KEY"] = _session_key
+        # A bare KIROCREW_SESSION_KEY only *declares* the identity; the gateway
+        # verifies nothing and answers identity_unattested, so every tool that needs
+        # an attested caller (spawn_run, memory_recall, ...) is refused. The attested
+        # path needs a minted stub token published against this session -- that is
+        # what the injected MCP servers normally carry.
+        _token = self._ensure_stub_token(_session_key)
+        _prior_token = os.environ.get(_STUB_TOKEN_ENV)
+        if _token:
+            os.environ[_STUB_TOKEN_ENV] = _token
+            try:
+                from kiro_crew.session_token_sig import publish_session_token
+
+                publish_session_token(_token, _session_key)
+            except Exception:  # noqa: BLE001
+                pass
         try:
             try:
                 result = await self._tool_executor.execute(fn_name, fn_args)
@@ -998,6 +1032,11 @@ class OpenAIProvider(LLMProvider):
                         os.environ.pop("KIROCREW_SESSION_KEY", None)
                     else:
                         os.environ["KIROCREW_SESSION_KEY"] = _prior_session_key
+                if _token:
+                    if _prior_token is None:
+                        os.environ.pop(_STUB_TOKEN_ENV, None)
+                    else:
+                        os.environ[_STUB_TOKEN_ENV] = _prior_token
         except Exception as exc:
             result = f"[Tool error: {exc}]"
             logger.exception("Tool %s raised", fn_name)
