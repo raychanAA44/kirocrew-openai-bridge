@@ -258,8 +258,23 @@ def _patch_factory_model() -> None:
                 try:
                     override = str(fkw.get("model_override") or "").strip()
                     session_key = fkw.get("session_key") or (fargs[0] if fargs else None)
-                    is_background = str(session_key) in ("_bg", "bg")
-                    if is_background:
+                    key = str(session_key or "")
+                    is_background = key in ("_bg", "bg")
+                    is_subagent = bool(key) and os.path.isdir(
+                        os.path.join(os.path.expanduser("~"), ".kiro", "crew", "subagents", key)
+                    )
+                    if is_subagent:
+                        # A subagent run is its own session. KiroCrew expects the
+                        # factory to resolve the agent spec's model pin; without it
+                        # the run silently executes on the chat model instead of the
+                        # configured subagent role model.
+                        role_model = _role_model("subagent")
+                        if role_model:
+                            fkw["model_override"] = role_model
+                            _log(f"factory session={key} subagent -> {role_model}")
+                        else:
+                            _log(f"factory session={key} subagent, no role model configured")
+                    elif is_background:
                         # Background work must run on the role's own model, not the
                         # chat model: agent.role_models.background is the user's pick.
                         role_model = _role_model("background")
