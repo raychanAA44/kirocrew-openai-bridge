@@ -170,6 +170,22 @@ def _patch_bg_session() -> None:
     _log("bg session patch installed")
 
 
+def _role_model(role: str) -> str:
+    """Read ``agent.role_models.<role>`` from KiroCrew's own config.
+
+    The provider factory is handed an agent name, not a role, so the role's model
+    pin (which KiroCrew normally resolves from the agent-spec snapshot) has to be
+    looked up here -- otherwise background work silently runs on the chat model.
+    """
+    try:
+        with open(os.path.join(os.path.expanduser("~"), ".kiro", "crew", "config.json"),
+                  encoding="utf-8-sig") as fh:
+            roles = (json.load(fh).get("agent") or {}).get("role_models") or {}
+        return str(roles.get(role) or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _last_pick_path() -> str:
     return os.path.join(_BOOT_DIR, "last_model.json")
 
@@ -242,13 +258,28 @@ def _patch_factory_model() -> None:
                 try:
                     override = str(fkw.get("model_override") or "").strip()
                     session_key = fkw.get("session_key") or (fargs[0] if fargs else None)
-                    if override in sentinels:
-                        recorded = _session_model(session_key) or _last_pick()
+                    is_background = str(session_key) in ("_bg", "bg")
+                    if is_background:
+                        # Background work must run on the role's own model, not the
+                        # chat model: agent.role_models.background is the user's pick.
+                        role_model = _role_model("background")
+                        if role_model:
+                            fkw["model_override"] = role_model
+                            _log(f"factory session={session_key} background -> {role_model}")
+                        else:
+                            _log(f"factory session={session_key} background, no role model configured")
+                    elif override in sentinels:
+                        recorded = _session_model(session_key)
                         if recorded:
                             fkw["model_override"] = recorded
-                            _log(f"factory session={session_key} sentinel -> {recorded}")
+                            _log(f"factory session={session_key} sentinel -> session model {recorded}")
                         else:
-                            _log(f"factory session={session_key} sentinel, nothing recorded")
+                            # No session identity and no record: let KiroCrew's own
+                            # configured default win. Remembering the last UI pick here
+                            # made every new chat answer with whichever model was picked
+                            # last, even though the UI showed the default.
+                            fkw.pop("model_override", None)
+                            _log(f"factory session={session_key} sentinel -> configured default")
                     else:
                         _log(f"factory session={session_key} model_override={override}")
                 except Exception as exc:  # noqa: BLE001
