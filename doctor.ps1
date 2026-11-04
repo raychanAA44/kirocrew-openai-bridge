@@ -187,4 +187,93 @@ for row in c.execute("select at, model, requested_model from usage order by id d
 }
 else { Info 'no hub ledger found - skip this check if you do not use a hub gateway' }
 
+# ── 7. streaming really streams ─────────────────────────────────────────────
+Step 7 'streaming (first byte < 3 s and more than one chunk)'
+$streamProbe = @'
+import json, os, sys, time
+for name in ("no_proxy", "NO_PROXY"):
+    os.environ[name] = "localhost,127.0.0.1"
+import httpx
+sys.path.insert(0, r"__INSTALL_DIR__")
+import provider_config
+cfg = provider_config.resolve()
+t0 = time.perf_counter()
+first = None
+chunks = 0
+try:
+    with httpx.stream("POST", cfg["base_url"].rstrip("/") + "/chat/completions",
+                      headers={"Authorization": "Bearer " + cfg["api_key"]},
+                      json={"model": cfg["model"], "stream": True, "max_tokens": 32,
+                            "messages": [{"role": "user", "content": "say ten words"}]},
+                      timeout=httpx.Timeout(connect=8, read=30, write=8, pool=8)) as r:
+        for _ in r.iter_bytes():
+            chunks += 1
+            if first is None:
+                first = int((time.perf_counter() - t0) * 1000)
+    print(json.dumps({"status": r.status_code, "first_ms": first, "chunks": chunks}))
+except Exception as exc:  # noqa: BLE001
+    print(json.dumps({"error": type(exc).__name__}))
+'@.Replace('__INSTALL_DIR__', $InstallDir)
+$streamRaw = (Invoke-PyFile $streamProbe 'stream' | Where-Object { $_ -match '^\s*\{' } | Select-Object -Last 1)
+try { $stream = $streamRaw | ConvertFrom-Json } catch { $stream = $null }
+if (-not $stream) { Bad "stream probe failed: $streamRaw" }
+elseif ($stream.error) { Bad "stream probe error: $($stream.error)" }
+else {
+    Info "HTTP $($stream.status), first byte $($stream.first_ms) ms, $($stream.chunks) chunks"
+    if ($stream.first_ms -and $stream.first_ms -lt 3000 -and $stream.chunks -gt 1) { Ok 'streams incrementally' }
+    else { Bad 'not streaming incrementally (upstream buffering, or a non-stream fallback)' }
+}
+
+# ── 8. context accounting counts the prompt only ────────────────────────────
+Step 8 'context accounting'
+$ctxProbe = @'
+import asyncio, json, os, sys
+for name in ("no_proxy", "NO_PROXY"):
+    os.environ[name] = "localhost,127.0.0.1"
+sys.path.insert(0, r"__INSTALL_DIR__")
+import provider_config
+from openai_provider.provider import DefaultToolExecutor, OpenAIProvider
+cfg = provider_config.resolve()
+
+async def main():
+    p = OpenAIProvider(base_url=cfg["base_url"], api_key=cfg["api_key"], model=cfg["model"],
+                       max_tokens=32, context_window=cfg["context_window"],
+                       tool_executor=DefaultToolExecutor(), session_key="doctor")
+    async for _ in p.stream("say five words", allow_image=True):
+        pass
+    print(json.dumps({"used": p.context_used_tokens(), "completion": p._completion_tokens,
+                      "window": p.context_window_tokens()}))
+
+asyncio.run(main())
+'@.Replace('__INSTALL_DIR__', $InstallDir)
+$ctxRaw = (Invoke-PyFile $ctxProbe 'context' | Where-Object { $_ -match '^\s*\{' } | Select-Object -Last 1)
+try { $ctx = $ctxRaw | ConvertFrom-Json } catch { $ctx = $null }
+if (-not $ctx) { Bad "context probe failed: $ctxRaw" }
+else {
+    Info "used=$($ctx.used) completion=$($ctx.completion) window=$($ctx.window)"
+    if ($ctx.used -gt 0) { Ok 'context used reports prompt tokens' }
+    else { Bad 'context used is zero after a turn' }
+    if ($ctx.completion -gt 0) { Ok 'completion tokens tracked separately' }
+}
+
+# ── 9. subagent runs get attributed to a chat ───────────────────────────────
+Step 9 'subagent attribution'
+$subDir = Join-Path (Join-Path $HOME '.kiro\crew') 'subagents'
+if (-not (Test-Path $subDir)) { Info 'no subagent runs yet' }
+else {
+    $latest = Get-ChildItem $subDir -Directory -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if (-not $latest) { Info 'no subagent runs yet' }
+    else {
+        $stateFile = Join-Path $latest.FullName 'state.json'
+        try { $st = Get-Content $stateFile -Raw -ErrorAction Stop | ConvertFrom-Json } catch { $st = $null }
+        if (-not $st) { Info "cannot read $stateFile (run finished or being written) - skip" }
+        else {
+            Info "$($latest.Name): parent='$($st.parent)' model=$($st.resolved_model)"
+            if ($st.parent) { Ok 'attributed to a chat (right-hand list can show it)' }
+            else { Bad 'parent is empty - the subagent list cannot place this run' }
+        }
+    }
+}
+
 Write-Host "`nDone. Paste this output when reporting an issue." -ForegroundColor Cyan
