@@ -65,9 +65,9 @@ def resolve() -> dict:
         "base_url": str(os.environ.get("OPENAI_BASE_URL") or own.get("base_url") or ""),
         "model": str(os.environ.get("OPENAI_MODEL") or own.get("model") or ""),
         "api_key": str(os.environ.get("OPENAI_API_KEY") or own.get("api_key") or ""),
-        "max_tokens": int(os.environ.get("OPENAI_MAX_TOKENS") or own.get("max_tokens") or 8192),
+        "max_tokens": int(os.environ.get("OPENAI_MAX_TOKENS") or own.get("max_tokens") or 32768),
         "context_window": int(
-            os.environ.get("OPENAI_CONTEXT_WINDOW") or own.get("context_window") or 1048000
+            os.environ.get("OPENAI_CONTEXT_WINDOW") or own.get("context_window") or 1000000
         ),
         "sources": {},
     }
