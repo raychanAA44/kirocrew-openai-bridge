@@ -12,6 +12,7 @@ Everything it does is reversible and logged to ``<bootstrap>/inject.log``.
 
 from __future__ import annotations
 
+import glob
 import os
 import sys
 import time
@@ -99,6 +100,85 @@ def _main() -> None:
     _log(f"installed base_url={cfg['base_url']} model={cfg['model']}")
 
     _patch_live_model_switch()
+    _patch_factory_model()
+
+
+def _session_model(session_key: str | None) -> str:
+    """Read the model KiroCrew recorded for a session, if any.
+
+    New sessions are created with a sentinel (``auto``/``""``) as ``model_override``
+    even when the dashboard just recorded a concrete pick, and the factory then
+    falls back to the configured default -- which is how a session ends up running
+    a different model than the one on its own header.
+    """
+    if not session_key:
+        return ""
+    sessions = os.path.join(os.path.expanduser("~"), ".kiro", "crew", "sessions")
+    names = [f"dashboard_{session_key}.jsonl"]
+    try:
+        names += [os.path.basename(p) for p in glob.glob(os.path.join(sessions, f"*{session_key}*.jsonl"))]
+    except Exception:  # noqa: BLE001
+        pass
+    for name in names:
+        path = os.path.join(sessions, name)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                head = fh.readline()
+            marker = '"model": "'
+            at = head.find(marker)
+            if at != -1:
+                return head[at + len(marker):head.find('"', at + len(marker))]
+        except Exception:  # noqa: BLE001
+            continue
+    return ""
+
+
+def _patch_factory_model() -> None:
+    """Feed the session's own model into the factory when the caller sends a sentinel."""
+    try:
+        from kiro_crew.config import loader as _loader
+    except Exception as exc:  # noqa: BLE001
+        _log(f"factory model patch skipped: {type(exc).__name__}: {exc}")
+        return
+
+    sentinels = {"", "auto"}
+
+    def _wrap(build):
+        def _wrapped_build(*args, **kwargs):
+            factory = build(*args, **kwargs)
+
+            def _factory(**kw):
+                override = str(kw.get("model_override") or "").strip()
+                if override in sentinels:
+                    session_key = kw.get("session_key")
+                    recorded = _session_model(session_key)
+                    if recorded:
+                        kw["model_override"] = recorded
+                        _log(f"factory session={session_key} sentinel -> session model {recorded}")
+                    else:
+                        _log(f"factory session={session_key} sentinel, no recorded model")
+                else:
+                    _log(f"factory session={kw.get('session_key')} model_override={override}")
+                return factory(**kw)
+
+            return _factory
+
+        return _wrapped_build
+
+    _loader.build_provider_factory = _wrap(_loader.build_provider_factory)
+    try:
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        original_create = KiroCrewConfig.create_provider_factory
+
+        def _create(self, *args, **kwargs):
+            return _wrap(lambda *a, **k: original_create(self, *a, **k))(*args, **kwargs)
+
+        KiroCrewConfig.create_provider_factory = _create  # type: ignore[assignment]
+    except Exception as exc:  # noqa: BLE001
+        _log(f"factory model patch (config) skipped: {type(exc).__name__}: {exc}")
+
+    _log("factory model patch installed")
 
 
 def _patch_live_model_switch() -> None:
