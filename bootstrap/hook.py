@@ -102,6 +102,72 @@ def _main() -> None:
 
     _patch_live_model_switch()
     _patch_factory_model()
+    _patch_bg_session()
+
+
+def _patch_bg_session() -> None:
+    """Give background work (auto-title, link summaries) a session it can use.
+
+    ``BackgroundSessionRuntime._provider_backed_bg_session`` asks the owner to
+    start the shared ``_bg`` session and then expects to find it in the session
+    map. With a provider-backed (non-ACP) backend that start can return without
+    registering anything, and the call then dies with
+
+        RuntimeError: background session unavailable for non-kiro _bg provider
+
+    so every background task fails. Here the session is built and registered the
+    same way the foreground path does it. The background *model* stays whatever
+    KiroCrew is configured with (``agent.role_models``) -- this patch only removes
+    the plumbing failure.
+    """
+    try:
+        from kiro_crew import session_background as _bg
+    except Exception as exc:  # noqa: BLE001
+        _log(f"bg session patch skipped: {type(exc).__name__}: {exc}")
+        return
+
+    runtime_cls = getattr(_bg, "BackgroundSessionRuntime", None)
+    original = getattr(runtime_cls, "_provider_backed_bg_session", None) if runtime_cls else None
+    if original is None:
+        _log("bg session patch skipped: seam not found")
+        return
+
+    async def _fallback(self):
+        deps = self._deps
+        owner = self._owner
+        factory = getattr(owner, "_provider_factory", None)
+        if factory is None:
+            raise RuntimeError("no provider factory for background session")
+        provider = factory(deps.background_key, agent=deps.background_agent)
+        await provider.start()
+        sess = deps.session_factory(
+            provider=provider,
+            first_turn=deps.first_turn_nothing_armed,
+            agent=deps.background_agent,
+        )
+        owner._sessions[deps.background_key] = sess
+        try:
+            owner._advance_session_generation(deps.background_key)
+        except Exception:  # noqa: BLE001
+            pass
+        _log(f"bg session created directly (agent={deps.background_agent})")
+        return deps.provider_bg_session_factory(sess)
+
+    async def _patched(self, *args, **kwargs):
+        try:
+            return await original(self, *args, **kwargs)
+        except RuntimeError as exc:
+            if "background session unavailable" not in str(exc):
+                raise
+            _log("bg session missing after ensure_background - building it here")
+            try:
+                return await _fallback(self)
+            except Exception as inner:  # noqa: BLE001
+                _log(f"bg fallback failed: {type(inner).__name__}: {inner}")
+                raise exc from inner
+
+    runtime_cls._provider_backed_bg_session = _patched  # type: ignore[assignment]
+    _log("bg session patch installed")
 
 
 def _last_pick_path() -> str:
