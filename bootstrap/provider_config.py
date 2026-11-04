@@ -45,6 +45,19 @@ def _strip_provider(name: str) -> str:
     return name
 
 
+def _looks_like_key(value: str) -> bool:
+    """Reject values that are obviously not a bearer token.
+
+    Catches the whole-JSON-accidentally-copied case, which otherwise surfaces at
+    request time as httpx's ``Illegal header value b'Bearer {\\r\\n ...'``.
+    """
+    if not value or len(value) > 200:
+        return False
+    if any(ch in value for ch in '{}"\r\n\t '):
+        return False
+    return True
+
+
 def resolve() -> dict:
     own = _read(PROVIDER_JSON)
 
@@ -82,9 +95,15 @@ def resolve() -> dict:
 
     cfg["base_url"] = cfg["base_url"].strip().rstrip("/") or "http://127.0.0.1:8888/v1"
     cfg["model"] = _strip_provider(cfg["model"].strip()) or "gpt-4o-mini"
-    # A stray newline in the key produces httpx's
-    # "Illegal header value b'Bearer '" / "invalid CRLF characters" at request time.
+
+    # A key that is not a key (whole JSON pasted in, stray newline, ...) produces
+    # "Illegal header value b'Bearer ...'" at request time and is hard to trace
+    # back to its file. Drop it here and fall back to the KiroCrew-managed id.
     cfg["api_key"] = "".join(cfg["api_key"].split())
+    if not _looks_like_key(cfg["api_key"]):
+        fallback = str(options.get("apiKey") or "").strip()
+        cfg["api_key"] = "".join(fallback.split()) if _looks_like_key(fallback) else ""
+        cfg["sources"]["api_key"] = "opencode.json (provider.json key rejected)" if cfg["api_key"] else "none (no usable key)"
     return cfg
 
 
