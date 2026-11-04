@@ -43,15 +43,16 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          foreach ($f in @('install.ps1', 'doctor.ps1')) {
-            $errors = $null
+          foreach ($file in @('install.ps1', 'doctor.ps1')) {
+            $parseErrors = $null
             [void][System.Management.Automation.Language.Parser]::ParseFile(
-              (Resolve-Path $f), [ref]$null, [ref]$errors)
-            if ($errors.Count -gt 0) {
-              $errors | ForEach-Object { Write-Error "$f: $($_.Message)" }
+              (Resolve-Path $file), [ref]$null, [ref]$parseErrors)
+            if ($parseErrors.Count -gt 0) {
+              # ${file} braces matter: "$file:" is parsed as a drive-qualified variable.
+              $parseErrors | ForEach-Object { Write-Error "${file}: $($_.Message)" }
               exit 1
             }
-            Write-Host "$f parses cleanly"
+            Write-Host "$file parses cleanly"
           }
 
       - name: Vendored provider imports its own modules
