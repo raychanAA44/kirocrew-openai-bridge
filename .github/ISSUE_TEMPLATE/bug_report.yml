@@ -1,0 +1,49 @@
+name: Bug report
+description: Something installed but does not behave as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Two things make a report answerable in one round:
+        the `doctor` output and the tail of `inject.log`. Everything else is guesswork.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected, what actually happened.
+    validations:
+      required: true
+  - type: input
+    id: crew-version
+    attributes:
+      label: KiroCrew version
+      description: Shown by `doctor` step 3, or from the app's About box.
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS and shell
+      placeholder: Windows 11 / PowerShell, Ubuntu 24.04 / bash, ...
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: doctor output
+      description: Full output of `doctor.ps1` or `./doctor.sh`.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: inject-log
+    attributes:
+      label: inject.log tail
+      description: Last ~20 lines of `inject.log` (in the support folder).
+      render: text
+  - type: textarea
+    id: endpoint
+    attributes:
+      label: Endpoint and model
+      description: "Base URL shape (redact the host if you must) and the model id involved."

@@ -13,6 +13,7 @@
 param(
     [string]$CrewBackend,
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'kirocrew-openai-bridge'),
+    [string]$LedgerPath,
     [int]$Port = 5476
 )
 
@@ -160,8 +161,16 @@ else { Bad "tool definitions: $toolCount (expected > 0; sessions would run witho
 
 # ── 6. ledger: served vs requested ───────────────────────────────────────────
 Step 6 'ledger (requested vs served)'
-$ledger = Get-ChildItem -Path @('D:\', (Join-Path $HOME 'AppData\Local')) -Recurse -Filter 'ledger.db' `
-    -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$ledger = $null
+if ($LedgerPath) {
+    if (Test-Path $LedgerPath) { $ledger = Get-Item $LedgerPath }
+    else { Bad "given ledger not found: $LedgerPath" }
+}
+if (-not $ledger) {
+    $searchRoots = @('D:\', (Join-Path $HOME 'AppData\Local'))
+    $ledger = Get-ChildItem -Path $searchRoots -Recurse -Filter 'ledger.db' `
+        -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+}
 if ($ledger) {
     Info "ledger: $($ledger.FullName)"
     $ledgerProbe = @'

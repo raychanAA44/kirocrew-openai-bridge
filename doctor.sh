@@ -4,7 +4,17 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/kirocrew-openai-bridge"
-CREW_BACKEND="${1:-}"
+CREW_BACKEND=""
+LEDGER=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --ledger) LEDGER="$2"; shift 2 ;;
+    --install-dir) INSTALL_DIR="$2"; shift 2 ;;
+    -h|--help) echo "usage: ./doctor.sh [--crew-backend DIR] [--install-dir DIR] [--ledger PATH]"; exit 0 ;;
+    *) CREW_BACKEND="$1"; shift ;;
+  esac
+done
 
 step() { printf '\n[%s] %s\n' "$1" "$2"; }
 ok()   { printf '    OK   %s\n' "$1"; }
@@ -90,7 +100,10 @@ PY
 if [ "${n:-0}" -gt 0 ] 2>/dev/null; then ok "tool definitions: $n"; else bad "tool definitions: ${n:-?} (expected > 0)"; fi
 
 step 6 'ledger (requested vs served)'
-ledger=$(find "$HOME" /d /opt -maxdepth 6 -name ledger.db -path '*hub*' 2>/dev/null | head -n 1)
+ledger="${LEDGER:-}"
+if [ -z "$ledger" ]; then
+  ledger=$(find "$HOME" /d /opt -maxdepth 6 -name ledger.db -path '*hub*' 2>/dev/null | head -n 1)
+fi
 if [ -n "${ledger:-}" ]; then
   info "ledger: $ledger"
   "$PY" - "$ledger" <<'PY' 2>&1 | while read -r l; do info "$l"; done

@@ -135,7 +135,8 @@ else {
 
 Step "Injection hook"
 $template = Get-Content (Join-Path $here 'bootstrap\hub_boot.py') -Raw
-$rendered = $template.Replace('@@BOOTSTRAP_DIR@@', $InstallDir.Replace('\', '\\'))
+# The template uses a raw string (r"..."), so the path goes in verbatim -- no escaping.
+$rendered = $template.Replace('@@BOOTSTRAP_DIR@@', $InstallDir)
 if ($DryRun) {
     Say "   would write $hookModule"
     Say "   would write $pth"

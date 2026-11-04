@@ -1,0 +1,58 @@
+name: tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  tests:
+    name: ${{ matrix.os }} · py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip pytest
+
+      - name: Unit tests
+        # These import the bootstrap modules with HUB_BRIDGE=0, so KiroCrew itself
+        # is not needed in CI: nothing here imports kiro_crew.
+        run: python -m pytest -q tests
+
+      - name: Byte-compile everything shipped
+        run: python -m compileall -q bootstrap vendor
+
+      - name: Shell syntax (POSIX)
+        if: runner.os == 'Linux'
+        run: |
+          bash -n install.sh
+          bash -n doctor.sh
+
+      - name: Script syntax (PowerShell)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          foreach ($f in @('install.ps1', 'doctor.ps1')) {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $f), [ref]$null, [ref]$errors)
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error "$f: $($_.Message)" }
+              exit 1
+            }
+            Write-Host "$f parses cleanly"
+          }
+
+      - name: Vendored provider imports its own modules
+        run: python -c "import ast, pathlib; [ast.parse(p.read_text(encoding='utf-8')) for p in pathlib.Path('vendor/openai_provider').glob('*.py')]; print('vendor syntax ok')"
