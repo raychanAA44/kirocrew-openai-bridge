@@ -147,19 +147,26 @@ def _patch_factory_model() -> None:
         def _wrapped_build(*args, **kwargs):
             factory = build(*args, **kwargs)
 
-            def _factory(**kw):
-                override = str(kw.get("model_override") or "").strip()
-                if override in sentinels:
-                    session_key = kw.get("session_key")
-                    recorded = _session_model(session_key)
-                    if recorded:
-                        kw["model_override"] = recorded
-                        _log(f"factory session={session_key} sentinel -> session model {recorded}")
+            def _factory(*fargs, **fkw):
+                # The factory is called both keyword-only and positionally
+                # (``provider_factory(session_key, agent=...)``), so nothing here may
+                # assume a signature -- and nothing may raise into KiroCrew: a broken
+                # patch would surface as HTTP 500 on "new chat".
+                try:
+                    override = str(fkw.get("model_override") or "").strip()
+                    session_key = fkw.get("session_key") or (fargs[0] if fargs else None)
+                    if override in sentinels:
+                        recorded = _session_model(session_key)
+                        if recorded:
+                            fkw["model_override"] = recorded
+                            _log(f"factory session={session_key} sentinel -> session model {recorded}")
+                        else:
+                            _log(f"factory session={session_key} sentinel, no recorded model")
                     else:
-                        _log(f"factory session={session_key} sentinel, no recorded model")
-                else:
-                    _log(f"factory session={kw.get('session_key')} model_override={override}")
-                return factory(**kw)
+                        _log(f"factory session={session_key} model_override={override}")
+                except Exception as exc:  # noqa: BLE001
+                    _log(f"factory model patch error: {type(exc).__name__}: {exc}")
+                return factory(*fargs, **fkw)
 
             return _factory
 
