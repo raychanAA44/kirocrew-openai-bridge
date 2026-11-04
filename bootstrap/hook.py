@@ -101,6 +101,7 @@ def _main() -> None:
     _log(f"installed base_url={cfg['base_url']} model={cfg['model']}")
 
     _patch_live_model_switch()
+    _patch_effort_capabilities()
     _patch_factory_model()
     _patch_bg_session()
 
@@ -375,6 +376,78 @@ def _patch_live_model_switch() -> None:
 
     _slot_model._try_live_model_switch = _bridge_live_switch  # type: ignore[assignment]
     _log("model-switch patch installed")
+
+
+def _patch_effort_capabilities() -> None:
+    """Report the served model's reasoning levels so the dashboard picker appears.
+
+    ``api_chat_slot_selection_capabilities`` answers ``known: false`` for any
+    provider that is not an ``AcpProvider``, so the effort picker the native
+    backend offered disappears the moment this bridge takes over -- whatever the
+    provider reports about its own support.
+
+    Only that ANSWER is rewritten here. The POST route is left to KiroCrew: it
+    resets the session for a non-ACP provider, and the factory now forwards
+    ``reasoning_effort_override``, so the picked level reaches the replacement
+    provider that reset creates.
+
+    Every failure path falls through to KiroCrew's own handler, so a seam change
+    degrades to the previous behaviour instead of turning into a 500.
+    """
+    try:
+        from aiohttp import web
+        from kiro_crew.dashboard.chat_api import slot_effort as se
+        # The helpers ``slot_effort`` calls are declared under TYPE_CHECKING and
+        # injected by ``chat_handlers`` at runtime, so they are NOT attributes of
+        # that module. Import the real homes instead of assuming they are there.
+        from kiro_crew.dashboard.chat_persistence import get_reasoning_effort_values
+        from kiro_crew.dashboard.chat_utils_slots import effective_session_key
+    except Exception as exc:  # noqa: BLE001
+        _log(f"effort-capabilities patch skipped: {type(exc).__name__}: {exc}")
+        return
+
+    original = getattr(se, "api_chat_slot_selection_capabilities", None)
+    if original is None:
+        _log("effort-capabilities patch skipped: seam not found")
+        return
+
+    def _levels(provider: object) -> list[str]:
+        getter = getattr(provider, "get_valid_effort_levels", None)
+        if not callable(getter):
+            return []
+        try:
+            raw = getter()
+            accepts = get_reasoning_effort_values()
+        except Exception:  # noqa: BLE001
+            return []
+        return [lv for lv in raw if isinstance(lv, str) and lv in accepts]
+
+    async def _bridge_capabilities(request):
+        try:
+            state = request.app["state"]
+            name = request.match_info["slot"]
+            slot = state._slots.get(name)
+            if slot is not None:
+                provider = state.sessions.get_provider(effective_session_key(slot))
+                levels = _levels(provider)
+                if levels:
+                    caps = getattr(provider, "capabilities", None)
+                    backend = str(getattr(caps, "backend", "") or "kiro")
+                    return web.json_response(
+                        {
+                            "known": True,
+                            "backend": backend,
+                            "effort_supported": True,
+                            "effort_levels": levels,
+                            "model_effort_pair_ids": False,
+                        }
+                    )
+        except Exception as exc:  # noqa: BLE001
+            _log(f"effort-capabilities: {type(exc).__name__}: {exc} — falling back")
+        return await original(request)
+
+    se.api_chat_slot_selection_capabilities = _bridge_capabilities  # type: ignore[assignment]
+    _log("effort-capabilities patch installed")
 
 
 try:

@@ -106,6 +106,14 @@ def install(
             context_window=cfg["context_window"],
             tool_executor=executor,
             session_key=session_key,
+            # KiroCrew resolves the session's reasoning level and handed it to
+            # AcpProvider as ``unbound_effort``. This factory accepted
+            # ``reasoning_effort_override`` and then dropped it on the floor, so
+            # every session ran at the model default while the UI showed the
+            # picked level.
+            reasoning_effort=reasoning_effort_override,
+            # Names the capability set the effort picker renders from.
+            acp_backend=str(_kwargs.get("acp_backend") or ""),
             compaction_threshold=cfg.get("compaction_threshold", 80),
             compaction_keep_recent=cfg.get("compaction_keep_recent", 6),
         )

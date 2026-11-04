@@ -291,6 +291,7 @@ class OpenAIProvider(LLMProvider):
         temperature: float | None = None,
         tool_executor: "ToolExecutor | None" = None,
         session_key: str | None = None,
+        acp_backend: str = "",
         reasoning_effort: str | None = None,
         compaction_threshold: int = DEFAULT_COMPACTION_THRESHOLD,
         compaction_keep_recent: int = DEFAULT_COMPACTION_KEEP_RECENT,
@@ -303,6 +304,11 @@ class OpenAIProvider(LLMProvider):
         self._temperature = temperature
         self._tool_executor: ToolExecutor = tool_executor or DefaultToolExecutor()
         self._session_key = session_key
+        # The ACP backend this bridge stands in for. KiroCrew asks
+        # ``provider.capabilities.backend`` when it renders the effort picker, and
+        # the value only has to name the harness whose capability set applies --
+        # ``capabilities_for`` is pure and total for any string.
+        self._acp_backend = acp_backend or "kiro"
         # Reasoning effort is a PER-MODEL capability, not a global switch: some
         # served models reject the field outright and one rejects ``none`` while
         # accepting every other level. ``_effort_for_model`` decides what this
@@ -477,6 +483,32 @@ class OpenAIProvider(LLMProvider):
         if want and want not in allowed:
             return False
         self._reasoning_effort = want
+        return True
+
+    @property
+    def capabilities(self):
+        """The ACP capability set of the backend this bridge stands in for.
+
+        ``capabilities_for`` is pure and total, so an id this build cannot name
+        fails closed instead of raising inside a request handler.
+        """
+        from kiro_crew.agent_sdk.capabilities import capabilities_for
+
+        return capabilities_for(self._acp_backend)
+
+    @property
+    def client(self) -> "OpenAIProvider":
+        """The object KiroCrew's ACP-shaped code calls into.
+
+        Session setup reads ``provider.client._model`` and may call
+        ``provider.client.set_model(...)``. This provider is its own client, so
+        that seam is satisfied without inventing a second object to keep in sync.
+        """
+        return self
+
+    async def clear_effort(self) -> bool:
+        """Drop the explicit level so the model's own default applies."""
+        self._reasoning_effort = ""
         return True
 
     def context_window_tokens(self) -> int:
