@@ -880,23 +880,7 @@ class OpenAIProvider(LLMProvider):
 
         # Execute the tool
         try:
-            # In-process tool execution has no caller context, signed token or pid
-        # mapping, so mcp_core._resolve_session_key() cannot name the session and
-        # spawn_run stored an empty parent_session -- the dashboard then had no
-        # chat to attribute the subagent to and the right-hand list stayed empty.
-        # Publish the key for the duration of the call.
-        _prior_key = os.environ.get("KIROCREW_SESSION_KEY")
-        _published = bool(self._session_key)
-        if _published:
-            os.environ["KIROCREW_SESSION_KEY"] = str(self._session_key)
-        try:
             result = await self._tool_executor.execute(fn_name, fn_args)
-        finally:
-            if _published:
-                if _prior_key is None:
-                    os.environ.pop("KIROCREW_SESSION_KEY", None)
-                else:
-                    os.environ["KIROCREW_SESSION_KEY"] = _prior_key
         except Exception as exc:
             result = f"[Tool error: {exc}]"
             logger.exception("Tool %s raised", fn_name)
