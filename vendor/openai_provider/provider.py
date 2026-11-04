@@ -1042,12 +1042,25 @@ class OpenAIProvider(LLMProvider):
                 if event.kind == EVENT_TEXT_CHUNK:
                     text_buffer.append(event)
                     pending = "".join(e.text for e in text_buffer)
-                    if len(pending) > _STREAM_GUARD_CHARS:
-                        tail = pending[-_STREAM_GUARD_CHARS:]
-                        safe = pending[:-_STREAM_GUARD_CHARS]
-                        text_buffer = [AcpEvent(kind=EVENT_TEXT_CHUNK, text=tail)]
-                        if safe:
-                            yield AcpEvent(kind=EVENT_TEXT_CHUNK, text=safe)
+                    # Only hold text that could still turn into an inline tool call.
+                    # Those start with "<tool_call>" or a ```json fence, so any chunk
+                    # carrying "<" or a backtick stays buffered. Plain prose is
+                    # released at once: holding everything until 160 characters made
+                    # every short answer arrive in a single piece at the very end --
+                    # a two-character reply was measured at 520 ms of perceived
+                    # latency it did not have.
+                    suspicious = ("<" in pending) or ("`" in pending)
+                    if suspicious:
+                        if len(pending) > _STREAM_GUARD_CHARS:
+                            tail = pending[-_STREAM_GUARD_CHARS:]
+                            safe = pending[:-_STREAM_GUARD_CHARS]
+                            text_buffer = [AcpEvent(kind=EVENT_TEXT_CHUNK, text=tail)]
+                            if safe:
+                                yield AcpEvent(kind=EVENT_TEXT_CHUNK, text=safe)
+                        continue
+                    if pending:
+                        yield AcpEvent(kind=EVENT_TEXT_CHUNK, text=pending)
+                        text_buffer = []
                     continue
                 # Everything else (rare in _stream_completion): buffer too
                 other_events.append(event)
