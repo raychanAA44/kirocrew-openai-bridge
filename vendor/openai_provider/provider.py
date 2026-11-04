@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import re as _re
+import time
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
@@ -134,6 +135,28 @@ def _live_session_key(own: "str | None") -> str:
         pass
     return ""
 
+_TRACE_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "request_models.log"
+)
+
+
+def _trace(kind: str, **fields: object) -> None:
+    """Append one line per turn: which model was asked for, which one answered.
+
+    Kept in its own file because it answers exactly one question -- when the
+    dashboard says model X, does X reach the wire and does the gateway answer as
+    X. No prompt text, no secrets, and a write failure is never allowed to matter.
+    """
+    try:
+        with open(_TRACE_PATH, "a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps({"t": time.strftime("%H:%M:%S"), "kind": kind, **fields},
+                           ensure_ascii=False) + "\n"
+            )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _crew_config() -> dict:
     """Read KiroCrew's own agent config (cheap, always current)."""
     try:
@@ -144,45 +167,94 @@ def _crew_config() -> dict:
         return {}
 
 
-#: Reasoning-effort levels each served model accepts, from the vendor docs.
-#: A model ABSENT from this map gets no ``reasoning_effort`` field at all --
-#: sending one to a route that does not take it is a 400, and the subagent
-#: routes here are free third-party models whose capability we cannot verify.
-#: Note ``gpt-6.1-sol`` and ``gpt-6-astra`` do NOT list ``none`` while
-#: ``gpt-6.1-terra``, ``gpt-6-sol`` and ``gpt-6-luna`` do.
-_EFFORT_SUPPORT: dict[str, tuple[str, ...]] = {
-    "gpt-6.1-sol": ("low", "medium", "high", "xhigh", "max"),
-    "gpt-6.1-terra": ("none", "low", "medium", "high", "xhigh", "max"),
-    "gpt-6-astra": ("low", "medium", "high", "xhigh", "max"),
-    "gpt-6-sol": ("none", "low", "medium", "high", "xhigh", "max"),
-    "gpt-6-luna": ("none", "low", "medium", "high", "xhigh", "max"),
-    # Third-party routes this backend drives subagents and background work on.
-    # Their vendors publish no effort matrix, so the three levels KiroCrew's own
-    # picker treats as the common denominator are what we send; every other
-    # level is dropped rather than risked on an undocumented endpoint.
-    "beam-free": ("low", "medium", "high"),
-    "deepseek-v4.1-flash": ("low", "medium", "high"),
-}
+_CATALOG_PATH = os.path.join(
+    os.path.expanduser("~"), ".config", "opencode", "opencode.json"
+)
+_CATALOG_CACHE: tuple[float, dict] = (0.0, {})
+
+
+def _catalog() -> dict:
+    """Return ``{model_id: entry}`` from the hub-neo catalog, cached by mtime.
+
+    That catalog is the same file the upstream gateway is configured from, so it
+    -- not a table written here -- is what says which models exist, how large
+    their window is, how much output they take, and which reasoning variants they
+    expose. Guessing any of it is what produced the failures this replaces: an id
+    the gateway did not know, answered by its default model, and an effort level
+    it does not accept.
+    """
+    global _CATALOG_CACHE
+    try:
+        mtime = os.path.getmtime(_CATALOG_PATH)
+    except OSError:
+        return {}
+    if _CATALOG_CACHE[0] == mtime:
+        return _CATALOG_CACHE[1]
+    try:
+        with open(_CATALOG_PATH, encoding="utf-8-sig") as fh:
+            models = (
+                ((json.load(fh).get("provider") or {}).get("hub-neo") or {}).get("models") or {}
+            )
+        if not isinstance(models, dict):
+            models = {}
+    except Exception:  # noqa: BLE001
+        models = {}
+    _CATALOG_CACHE = (mtime, models)
+    return models
+
+
+def _catalog_entry(model: str) -> dict:
+    """The catalog entry for *model*, keyed the way the upstream gateway sees it."""
+    key = _bare_model(model)
+    if not key:
+        return {}
+    models = _catalog()
+    entry = models.get(key)
+    if isinstance(entry, dict):
+        return entry
+    low = key.lower()
+    for name, candidate in models.items():
+        if isinstance(candidate, dict) and str(name).lower() == low:
+            return candidate
+    return {}
 
 
 def _effort_levels_for(model: str) -> tuple[str, ...]:
-    """The effort levels *model* is documented to accept, or () if none.
+    """The reasoning variants the catalog advertises for *model*, or () if none.
 
-    Exact id first, then the longest family prefix that matches, so
-    ``deepseek-v4.1-flash:1017`` still resolves to its family entry.
+    No entry, or ``reasoning: false``, means unknown/unsupported, and unknown
+    sends no field at all: the gateway answers an unsupported level with an error
+    rather than silently downgrading it.
     """
-    bare = str(model or "").rsplit("/", 1)[-1].strip().lower()
-    if not bare:
+    entry = _catalog_entry(model)
+    if entry.get("reasoning") is False:
         return ()
-    levels = _EFFORT_SUPPORT.get(bare)
-    if levels is not None:
-        return levels
-    best: tuple[str, ...] = ()
-    best_len = 0
-    for family, supported in _EFFORT_SUPPORT.items():
-        if bare.startswith(family) and len(family) > best_len:
-            best, best_len = supported, len(family)
-    return best
+    variants = entry.get("variants")
+    if not isinstance(variants, dict):
+        return ()
+    return tuple(str(k).strip().lower() for k in variants if str(k).strip())
+
+
+def _catalog_context(model: str) -> int:
+    """The context window the catalog declares for *model*, or 0 if unknown."""
+    limit = _catalog_entry(model).get("limit")
+    if not isinstance(limit, dict):
+        return 0
+    try:
+        return int(limit.get("context") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _catalog_output_cap(model: str) -> int:
+    """The output-token ceiling the catalog declares for *model*, or 0 if unknown."""
+    limit = _catalog_entry(model).get("limit")
+    if not isinstance(limit, dict):
+        return 0
+    try:
+        return int(limit.get("output") or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _effort_for_model(model: str, explicit: "str | None") -> str:
@@ -369,6 +441,14 @@ class OpenAIProvider(LLMProvider):
           5. Fallback to ``max_tokens``
         """
         import httpx
+
+        # Priority 0: the upstream catalog's own per-model window. That file is
+        # what the gateway is configured from, so it outranks every table kept on
+        # this side -- a window that disagrees with it is simply wrong.
+        catalog_ctx = _catalog_context(self._model)
+        if catalog_ctx:
+            self._context_window = catalog_ctx
+            return
 
         # Priority 0.5: the table KiroCrew maintains per model
         # (agent.model_context_tokens). KSWA's /v1/models carries no context
@@ -992,8 +1072,14 @@ class OpenAIProvider(LLMProvider):
             "stream": True,
             "stream_options": {"include_usage": True},
         }
-        if self._max_tokens:
-            payload["max_tokens"] = self._max_tokens
+        # The catalog's per-model output ceiling is the real limit; asking for
+        # more than a route allows is rejected, not clamped, by the gateway.
+        _out_cap = _catalog_output_cap(self._model)
+        _max_out = self._max_tokens
+        if _out_cap and _max_out and _max_out > _out_cap:
+            _max_out = _out_cap
+        if _max_out:
+            payload["max_tokens"] = _max_out
         if self._temperature is not None:
             payload["temperature"] = self._temperature
         # Per-model: "" means this route takes no effort field (see _effort_for_model).
@@ -1010,6 +1096,13 @@ class OpenAIProvider(LLMProvider):
 
         # Accumulate tool calls across chunks
         accumulated_tool_calls: dict[int, dict] = {}
+        _served_logged = False
+        _trace(
+            "request",
+            requested=payload["model"],
+            effort=self._reasoning_effort,
+            session=self._session_key,
+        )
         finish_reason = "stop"
         assistant_text = ""
 
@@ -1047,6 +1140,18 @@ class OpenAIProvider(LLMProvider):
                         chunk = json.loads(data)
                     except json.JSONDecodeError:
                         continue
+
+                    # Which model actually answered. The dashboard can show one
+                    # model while the wire carries another; recording both sides
+                    # once per response is what tells those two apart.
+                    if not _served_logged:
+                        _served_logged = True
+                        _trace(
+                            "served",
+                            requested=payload["model"],
+                            served=chunk.get("model"),
+                            session=self._session_key,
+                        )
 
                     # Usage (last chunk on many providers)
                     if usage := chunk.get("usage"):
