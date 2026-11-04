@@ -82,28 +82,6 @@ def _bare_model(model: str | None) -> str:
 _PENDING_APPROVALS: dict[str, asyncio.Future] = {}
 
 
-def _live_session_key(own: str | None) -> str:
-    """Best-effort identity for the running chat.
-
-    The factory hands ``session_key=None`` for dashboard chats, and KiroCrew's tools
-    attribute background work through ``mcp_core._resolve_session_key()``. Without a
-    key, ``spawn_run`` stored ``parent_session=""`` and the dashboard's subagent list
-    had nothing to attach the run to. Fall back to the most recently opened slot.
-    """
-    key = str(own or "").strip()
-    if key:
-        return key
-    try:
-        path = os.path.join(os.path.expanduser("~"), ".kiro", "crew", "open_slots.json")
-        with open(path, encoding="utf-8-sig") as fh:
-            keys = json.load(fh).get("keys") or []
-        if keys:
-            return f"dashboard:{keys[-1]}"
-    except Exception:  # noqa: BLE001
-        pass
-    return ""
-
-
 def _normalise_tool_calls(calls: "list[dict]") -> "list[dict]":
     """Return tool calls in the exact shape an OpenAI server accepts back.
 
@@ -909,10 +887,9 @@ class OpenAIProvider(LLMProvider):
         # chat -- the right-hand subagent list stayed empty. Publish the key for the
         # duration of the call (level 3 of that ladder).
         _prior_session_key = os.environ.get("KIROCREW_SESSION_KEY")
-        _publish = _live_session_key(self._session_key)
-        _published_session_key = bool(_publish)
+        _published_session_key = bool(self._session_key)
         if _published_session_key:
-            os.environ["KIROCREW_SESSION_KEY"] = _publish
+            os.environ["KIROCREW_SESSION_KEY"] = str(self._session_key)
         try:
             try:
                 result = await self._tool_executor.execute(fn_name, fn_args)
