@@ -99,8 +99,13 @@ def resolve() -> dict:
             cfg["model"] = model
             cfg["sources"]["model"] = "crew config.json"
 
-    cfg["base_url"] = cfg["base_url"].strip().rstrip("/") or "http://127.0.0.1:8888/v1"
-    cfg["model"] = _strip_provider(cfg["model"].strip()) or "gpt-4o-mini"
+    # These two are what a FRESH install lands on when nothing else is configured,
+    # and the old pair was a trap: 8888 was a gateway that rejects this key, and
+    # gpt-4o-mini is served by none of the endpoints, so the first request failed
+    # with "Illegal header value" or "Model is unavailable" and nothing said why.
+    # A working default matters more than a generic-looking one.
+    cfg["base_url"] = cfg["base_url"].strip().rstrip("/") or "http://127.0.0.1:28791/v1"
+    cfg["model"] = _strip_provider(cfg["model"].strip()) or "oc/beam-free"
 
     # A key that is not a key (whole JSON pasted in, stray newline, ...) produces
     # "Illegal header value b'Bearer ...'" at request time and is hard to trace

@@ -1,8 +1,8 @@
 {
   "_comment": "Written by install.ps1 / install.sh. Environment variables win over these values.",
-  "base_url": "http://127.0.0.1:8888/v1",
+  "base_url": "http://127.0.0.1:28791/v1",
   "api_key": "",
-  "model": "gpt-4o-mini",
-  "max_tokens": 8192,
-  "context_window": 128000
+  "model": "oc/beam-free",
+  "max_tokens": 32768,
+  "context_window": 1000000
 }

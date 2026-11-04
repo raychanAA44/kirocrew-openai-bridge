@@ -12,7 +12,7 @@
     Needs administrator rights because KiroCrew usually lives under Program Files.
 
 .EXAMPLE
-    .\install.ps1 -BaseUrl http://127.0.0.1:8888/v1 -ApiKey sk-xxx -Model ollama/llama3.3:70b
+    .\install.ps1 -BaseUrl http://127.0.0.1:28791/v1 -ApiKey sk-xxx -Model oc/beam-free
 
 .EXAMPLE
     .\install.ps1 -DryRun

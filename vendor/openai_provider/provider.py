@@ -1146,6 +1146,16 @@ class OpenAIProvider(LLMProvider):
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
 
+        # An empty key used to surface as httpx's "Illegal header value b'Bearer '"
+        # from inside header assembly, which says nothing about the missing key or
+        # where it should have come from. Fail here, in words, first.
+        if not str(self._api_key or "").strip():
+            raise RuntimeError(
+                "no API key configured for the OpenAI-compatible provider: set "
+                "api_key in provider.json (install.ps1 writes one), or export "
+                "OPENAI_API_KEY, or let KiroCrew's provider entry supply it"
+            )
+
         headers = {
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",

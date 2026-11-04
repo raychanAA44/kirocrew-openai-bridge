@@ -22,9 +22,9 @@ usage() {
 usage: ./install.sh [options]
 
   --crew-backend DIR   KiroCrew backend dir (the one containing python + Lib/site-packages)
-  --base-url URL       e.g. http://127.0.0.1:8888/v1
+  --base-url URL       e.g. http://127.0.0.1:28791/v1
   --api-key KEY        bearer token (prefer the OPENAI_API_KEY environment variable)
-  --model NAME         e.g. ollama/llama3.3:70b
+  --model NAME         e.g. oc/beam-free
   --max-tokens N       default 8192
   --context-window N   default 128000
   --install-dir DIR    default ~/.local/share/kirocrew-openai-bridge
