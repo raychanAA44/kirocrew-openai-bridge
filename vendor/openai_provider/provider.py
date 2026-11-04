@@ -129,6 +129,8 @@ class OpenAIProvider(LLMProvider):
 
         # Cancel support
         self._cancel_event: asyncio.Event = asyncio.Event()
+        #: True while a turn is streaming -- steering is only accepted then.
+        self._in_turn: bool = False
         self._alive: bool = False
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
@@ -514,6 +516,26 @@ class OpenAIProvider(LLMProvider):
         if bare:
             self._model = bare
 
+    async def steer(self, message: str) -> bool:
+        """Inject a message into the turn that is currently running.
+
+        KiroCrew's steering (the dashboard's steer action and the ``spawn_steer``
+        tool) calls this, and reports ``steer rejected by provider`` when the method
+        is missing or returns False. The HTTP request already in flight cannot be
+        amended, so the text is appended to the conversation and is picked up by the
+        next tool-loop iteration of the running turn. Returns False when no turn is
+        running -- there is nothing to steer into and the caller should queue it.
+        """
+        text = (message or "").strip()
+        if not text or not self._in_turn:
+            return False
+        self._messages.append({"role": "user", "content": text})
+        return True
+
+    def has_active_turn(self) -> bool:
+        """Whether a turn is in flight (KiroCrew asks before live operations)."""
+        return self._in_turn
+
     async def stream(self, message: str, **kwargs: object) -> AsyncIterator[AcpEvent]:  # type: ignore[override]
         """Send a user message and yield AcpEvents until end_turn or cancel.
 
@@ -522,28 +544,33 @@ class OpenAIProvider(LLMProvider):
         ``TypeError: stream() got an unexpected keyword argument``.
         """
         self._cancel_event.clear()
+        self._in_turn = True
         self._messages.append({"role": "user", "content": message})
+        try:
+            # Auto-compact if context usage is high
+            await self._maybe_compact()
 
-        # Auto-compact if context usage is high
-        await self._maybe_compact()
+            # Tool definitions from executor. Discovery is async and, when called
+            # from inside a running loop, ``tool_definitions()`` only *schedules* it
+            # and returns an empty list -- which handed the model a tool-less prompt
+            # on the first turn of every session. Await the discovery first.
+            fetch = getattr(self._tool_executor, "_fetch_tools_async", None)
+            if fetch is not None:
+                try:
+                    await fetch()
+                except Exception:  # noqa: BLE001
+                    pass
+            tools = self._tool_executor.tool_definitions()
 
-        # Tool definitions from executor. Discovery is async and, when called
-        # from inside a running loop, ``tool_definitions()`` only *schedules* it
-        # and returns an empty list -- which handed the model a tool-less prompt
-        # on the first turn of every session. Await the discovery first.
-        fetch = getattr(self._tool_executor, "_fetch_tools_async", None)
-        if fetch is not None:
-            try:
-                await fetch()
-            except Exception:  # noqa: BLE001
-                pass
-        tools = self._tool_executor.tool_definitions()
-
-        async for event in self._run_turn(tools):
-            if self._cancel_event.is_set():
-                yield AcpEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_CANCELLED)
-                return
-            yield event
+            async for event in self._run_turn(tools):
+                if self._cancel_event.is_set():
+                    yield AcpEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_CANCELLED)
+                    return
+                yield event
+        finally:
+            # Steering is only accepted while this is True; a turn that ends (or is
+            # cancelled, or whose generator is closed) must stop accepting steers.
+            self._in_turn = False
 
     async def _run_turn(self, tools: list[dict]) -> AsyncIterator[AcpEvent]:
         """Inner turn loop — handles tool call cycles.
