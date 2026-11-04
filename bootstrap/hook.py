@@ -98,6 +98,60 @@ def _main() -> None:
     openai_provider.install()
     _log(f"installed base_url={cfg['base_url']} model={cfg['model']}")
 
+    _patch_live_model_switch()
+
+
+def _patch_live_model_switch() -> None:
+    """Let the dashboard's model picker reach this provider.
+
+    ``slot_model._try_live_model_switch`` bails out early for anything that is not
+    an ``AcpProvider``, so a pick in the UI was only committed to the slot while the
+    provider kept the model it was constructed with -- the classic "the UI says one
+    model, the requests use another". The caller then falls back to resetting the
+    session, which for this bridge does not rebuild the provider either.
+
+    Here the switch is applied directly through ``provider.set_model`` when the
+    provider has it, and ``True`` is returned so the caller keeps the conversation.
+    """
+    try:
+        from kiro_crew.dashboard.chat_api import slot_model as _slot_model
+    except Exception as exc:  # noqa: BLE001
+        _log(f"model-switch patch skipped: {type(exc).__name__}: {exc}")
+        return
+
+    original = getattr(_slot_model, "_try_live_model_switch", None)
+    if original is None:
+        _log("model-switch patch skipped: seam not found")
+        return
+
+    async def _bridge_live_switch(name, slot, provider, model_name):
+        setter = getattr(provider, "set_model", None)
+        if setter is None:
+            return await original(name, slot, provider, model_name)
+
+        busy = getattr(provider, "has_active_turn", None)
+        if callable(busy):
+            try:
+                if busy():
+                    return False
+            except Exception:  # noqa: BLE001
+                pass
+
+        wire = (model_name or "").strip()
+        if not wire or wire == "auto":
+            return await original(name, slot, provider, model_name)
+
+        try:
+            await setter(wire)
+        except Exception as exc:  # noqa: BLE001
+            _log(f"live model switch to {wire} failed: {type(exc).__name__}: {exc}")
+            return await original(name, slot, provider, model_name)
+        _log(f"live model switch -> {wire}")
+        return True
+
+    _slot_model._try_live_model_switch = _bridge_live_switch  # type: ignore[assignment]
+    _log("model-switch patch installed")
+
 
 try:
     _main()
