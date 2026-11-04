@@ -1,0 +1,39 @@
+# NOTICE
+
+## Vendored third-party code
+
+`vendor/openai_provider/` and `vendor/gateway.py` are a snapshot of
+
+> **KiroCrew-OpenAI-Compatible** — https://github.com/lenovo1996/KiroCrew-OpenAI-Compatible
+> MIT License, Copyright (c) 2026 openai_provider contributors
+
+Their license text is reproduced in `vendor/LICENSE`. The snapshot is unmodified
+relative to commit `763437e`, **plus** the changes listed below.
+
+## Changes applied to the vendored code
+
+Kept in `patches/` so they can be replayed onto a newer upstream snapshot
+(`git apply -p1 --directory=vendor patches/*.patch`), and submitted upstream as
+[PR #7](https://github.com/lenovo1996/KiroCrew-OpenAI-Compatible/pull/7):
+
+1. `stream()` accepts `**kwargs` — KiroCrew 0.11 calls
+   `provider.stream(message, allow_image=...)`, which used to raise
+   `TypeError` before any token was requested.
+2. `stream()` awaits `_fetch_tools_async()` before reading the tool table — the
+   synchronous `tool_definitions()` only *schedules* discovery inside a running
+   loop and returned `[]`, so the first turn of every session had no tools.
+3. `set_model()` added (plus `_bare_model()` to strip the `<provider>/` prefix) —
+   without it the dashboard's model picker was silently ignored.
+
+## What this project adds on top
+
+- `bootstrap/` — the injection hook (`hub_boot.pth` + `hub_boot.py` +
+  `sitecustomize.py`), the config resolver (`provider_config.py`), and the
+  single-instance tool-executor cache.
+- `install.ps1` / `install.sh` / `doctor.ps1` / `doctor.sh`.
+- Documentation, tests, and the measured numbers in `README.md`.
+
+## Not included
+
+KiroCrew itself. It is proprietary software; this project only writes two small
+files into its Python environment at install time and removes them on uninstall.
