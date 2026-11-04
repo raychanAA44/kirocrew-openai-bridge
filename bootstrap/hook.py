@@ -51,6 +51,10 @@ def _main() -> None:
 
     if os.environ.get("HUB_BRIDGE", "1") == "0":
         return
+    # 文件级停用开关。环境变量改不了已经在跑的 App（网关由壳带旧环境重启），
+    # 落一个文件就能让下一次解释器启动跳过整个注入；回滚 = 删掉这个文件。
+    if os.path.isfile(os.path.join(_BOOT_DIR, "DISABLED")):
+        return
     if "gateway" not in " ".join(sys.argv[1:]):
         return
 
