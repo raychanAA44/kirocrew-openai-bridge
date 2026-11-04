@@ -156,6 +156,12 @@ _EFFORT_SUPPORT: dict[str, tuple[str, ...]] = {
     "gpt-6-astra": ("low", "medium", "high", "xhigh", "max"),
     "gpt-6-sol": ("none", "low", "medium", "high", "xhigh", "max"),
     "gpt-6-luna": ("none", "low", "medium", "high", "xhigh", "max"),
+    # Third-party routes this backend drives subagents and background work on.
+    # Their vendors publish no effort matrix, so the three levels KiroCrew's own
+    # picker treats as the common denominator are what we send; every other
+    # level is dropped rather than risked on an undocumented endpoint.
+    "beam-free": ("low", "medium", "high"),
+    "deepseek-v4.1-flash": ("low", "medium", "high"),
 }
 
 
