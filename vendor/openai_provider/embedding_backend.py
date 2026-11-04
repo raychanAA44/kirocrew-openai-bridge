@@ -99,12 +99,20 @@ class OpenAIEmbeddingBackend(EmbeddingBackend):
         except Exception:
             return False
 
-    def embed(self, text: str) -> list[float] | None:
-        """Embed a single text. Returns None on any failure."""
+    def embed(self, text: str, *, priority: int | None = None) -> list[float] | None:
+        """Embed a single text. Returns None on any failure.
+
+        ``priority`` is KiroCrew's scheduling class (``PRIORITY_*``). A remote HTTP
+        endpoint has no equivalent pool, so the value is accepted and ignored -- but
+        it MUST be in the signature. KiroCrew's availability probe calls
+        ``embed(text, priority=PRIORITY_BULK)``, and the missing parameter raised
+        TypeError there, which took the whole gateway down rather than degrading one
+        embedding call.
+        """
         result = self.embed_batch([text])
         return result[0] if result else None
 
-    def embed_batch(self, texts: list[str]) -> list[list[float]] | None:
+    def embed_batch(self, texts: list[str], *, priority: int | None = None) -> list[list[float]] | None:
         """Embed multiple texts via the remote API.
 
         Returns None on any failure (network, API error, dimension mismatch).
