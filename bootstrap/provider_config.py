@@ -69,6 +69,12 @@ def resolve() -> dict:
         "context_window": int(
             os.environ.get("OPENAI_CONTEXT_WINDOW") or own.get("context_window") or 1000000
         ),
+        # "" defers to KiroCrew's agent.reasoning_effort, which is the setting the
+        # dashboard writes. The provider drops the level anyway unless the served
+        # model documents it, so an inherited level cannot 400 a subagent route.
+        "reasoning_effort": str(
+            os.environ.get("OPENAI_REASONING_EFFORT") or own.get("reasoning_effort") or ""
+        ).strip().lower(),
         "sources": {},
     }
     if cfg["base_url"]:
@@ -110,10 +116,13 @@ def resolve() -> dict:
 def as_env(cfg: dict | None = None) -> dict:
     """Return the ``OPENAI_*`` environment mapping for a resolved config."""
     cfg = cfg or resolve()
-    return {
+    env = {
         "OPENAI_BASE_URL": cfg["base_url"],
         "OPENAI_API_KEY": cfg["api_key"],
         "OPENAI_MODEL": cfg["model"],
         "OPENAI_MAX_TOKENS": str(cfg["max_tokens"]),
         "OPENAI_CONTEXT_WINDOW": str(cfg["context_window"]),
     }
+    if cfg.get("reasoning_effort"):
+        env["OPENAI_REASONING_EFFORT"] = cfg["reasoning_effort"]
+    return env

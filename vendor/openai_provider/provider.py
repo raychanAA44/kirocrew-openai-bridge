@@ -144,6 +144,48 @@ def _crew_config() -> dict:
         return {}
 
 
+#: Reasoning-effort levels each served model accepts, from the vendor docs.
+#: A model ABSENT from this map gets no ``reasoning_effort`` field at all --
+#: sending one to a route that does not take it is a 400, and the subagent
+#: routes here are free third-party models whose capability we cannot verify.
+#: Note ``gpt-6.1-sol`` and ``gpt-6-astra`` do NOT list ``none`` while
+#: ``gpt-6.1-terra``, ``gpt-6-sol`` and ``gpt-6-luna`` do.
+_EFFORT_SUPPORT: dict[str, tuple[str, ...]] = {
+    "gpt-6.1-sol": ("low", "medium", "high", "xhigh", "max"),
+    "gpt-6.1-terra": ("none", "low", "medium", "high", "xhigh", "max"),
+    "gpt-6-astra": ("low", "medium", "high", "xhigh", "max"),
+    "gpt-6-sol": ("none", "low", "medium", "high", "xhigh", "max"),
+    "gpt-6-luna": ("none", "low", "medium", "high", "xhigh", "max"),
+}
+
+
+def _effort_for_model(model: str, explicit: "str | None") -> str:
+    """The ``reasoning_effort`` to send for *model*, or "" to send none.
+
+    *explicit* wins when the caller supplied one; otherwise KiroCrew's
+    ``agent.reasoning_effort`` is used. Either way the value is dropped unless
+    THIS model documents the level, so a chat-level setting never leaks onto a
+    subagent route that would reject it.
+    """
+    bare = str(model or "").rsplit("/", 1)[-1].strip().lower()
+    if not bare:
+        return ""
+    allowed = _EFFORT_SUPPORT.get(bare)
+    if allowed is None:
+        for family, levels in _EFFORT_SUPPORT.items():
+            if bare.startswith(family):
+                allowed = levels
+                break
+    if allowed is None:
+        return ""
+    want = str(explicit or "").strip().lower()
+    if not want:
+        want = str(_crew_config().get("reasoning_effort") or "").strip().lower()
+    if not want or want not in allowed:
+        return ""
+    return want
+
+
 def _crew_model_context(model: str) -> int:
     """Context window KiroCrew recorded for this model, or 0 when it has none.
 
@@ -233,6 +275,7 @@ class OpenAIProvider(LLMProvider):
         temperature: float | None = None,
         tool_executor: "ToolExecutor | None" = None,
         session_key: str | None = None,
+        reasoning_effort: str | None = None,
         compaction_threshold: int = DEFAULT_COMPACTION_THRESHOLD,
         compaction_keep_recent: int = DEFAULT_COMPACTION_KEEP_RECENT,
     ) -> None:
@@ -244,6 +287,12 @@ class OpenAIProvider(LLMProvider):
         self._temperature = temperature
         self._tool_executor: ToolExecutor = tool_executor or DefaultToolExecutor()
         self._session_key = session_key
+        # Reasoning effort is a PER-MODEL capability, not a global switch: some
+        # served models reject the field outright and one rejects ``none`` while
+        # accepting every other level. ``_effort_for_model`` decides what this
+        # model actually accepts, so a level configured for the chat model is never
+        # sent to a subagent model that would 400 on it.
+        self._reasoning_effort = _effort_for_model(self._model, reasoning_effort)
 
         # Context window for reporting (separate from max_tokens output limit)
         # If not provided, will be resolved from /v1/models in start()
@@ -871,6 +920,9 @@ class OpenAIProvider(LLMProvider):
             payload["max_tokens"] = self._max_tokens
         if self._temperature is not None:
             payload["temperature"] = self._temperature
+        # Per-model: "" means this route takes no effort field (see _effort_for_model).
+        if self._reasoning_effort:
+            payload["reasoning_effort"] = self._reasoning_effort
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
