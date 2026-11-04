@@ -13,6 +13,7 @@ Everything it does is reversible and logged to ``<bootstrap>/inject.log``.
 from __future__ import annotations
 
 import glob
+import json
 import os
 import sys
 import time
@@ -103,6 +104,26 @@ def _main() -> None:
     _patch_factory_model()
 
 
+def _last_pick_path() -> str:
+    return os.path.join(_BOOT_DIR, "last_model.json")
+
+
+def _remember_pick(model: str) -> None:
+    try:
+        with open(_last_pick_path(), "w", encoding="utf-8") as fh:
+            json.dump({"model": model, "at": time.time()}, fh)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _last_pick() -> str:
+    try:
+        with open(_last_pick_path(), encoding="utf-8") as fh:
+            return str(json.load(fh).get("model") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _session_model(session_key: str | None) -> str:
     """Read the model KiroCrew recorded for a session, if any.
 
@@ -156,12 +177,12 @@ def _patch_factory_model() -> None:
                     override = str(fkw.get("model_override") or "").strip()
                     session_key = fkw.get("session_key") or (fargs[0] if fargs else None)
                     if override in sentinels:
-                        recorded = _session_model(session_key)
+                        recorded = _session_model(session_key) or _last_pick()
                         if recorded:
                             fkw["model_override"] = recorded
-                            _log(f"factory session={session_key} sentinel -> session model {recorded}")
+                            _log(f"factory session={session_key} sentinel -> {recorded}")
                         else:
-                            _log(f"factory session={session_key} sentinel, no recorded model")
+                            _log(f"factory session={session_key} sentinel, nothing recorded")
                     else:
                         _log(f"factory session={session_key} model_override={override}")
                 except Exception as exc:  # noqa: BLE001
@@ -233,6 +254,10 @@ def _patch_live_model_switch() -> None:
         except Exception as exc:  # noqa: BLE001
             _log(f"live model switch to {wire} failed: {type(exc).__name__}: {exc}")
             return await original(name, slot, provider, model_name)
+        # Remember it: when this provider is later rebuilt (idle timeout, app
+        # restart) KiroCrew creates it with a sentinel override, and without this
+        # the session silently reverts to the configured default model.
+        _remember_pick(wire)
         _log(f"live model switch -> {wire}")
         return True
 
