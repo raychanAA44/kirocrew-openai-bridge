@@ -32,6 +32,13 @@ best and median reported. Hub-side prompt/ttft numbers come from the gateway's o
 | prefix-cache hit | 99.6 % (after pinning TMP) | 98.7 % |
 | ttft (model side) | 645–1,020 ms | 632–1,664 ms |
 
+Per-model spread matters more than the bridge: the same session shape against
+`rekiro/claude-sonnet-5-5` (44 k prompt, 76–79 % cache hit) measured ttft
+3.7–6.7 s and 3.7–8.7 s per turn, while `ollama/deepseek-v4.1-flash:1017`
+(35 k prompt, 98.7 % cache) measured ttft 0.63–1.66 s and 2.3 s per turn. The
+structural gain of this bridge — no child process, no cold start — is independent
+of the model; the rest is the endpoint.
+
 The harness case only reached 99.6 % after pinning `TMP`/`TEMP` to a fixed directory:
 opencode wrote a per-session random scratch path into the `bash` tool description, and
 `bash` is always `tools[0]`, so the cached prefix broke on the first tool. This bridge
