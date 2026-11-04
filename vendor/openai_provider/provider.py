@@ -113,6 +113,27 @@ def _normalise_tool_calls(calls: "list[dict]") -> "list[dict]":
         )
     return out
 
+def _live_session_key(own: "str | None") -> str:
+    """Identity to publish while a tool runs.
+
+    The provider factory hands over ``session_key=None`` for dashboard chats, and
+    KiroCrew attributes background work through mcp_core._resolve_session_key().
+    Without a key spawn_run stored parent_session="" and the dashboard could not
+    place the subagent. Fall back to the most recently opened slot.
+    """
+    key = str(own or "").strip()
+    if key:
+        return key
+    try:
+        path = os.path.join(os.path.expanduser("~"), ".kiro", "crew", "open_slots.json")
+        with open(path, encoding="utf-8-sig") as fh:
+            keys = json.load(fh).get("keys") or []
+        if keys:
+            return "dashboard:" + str(keys[-1])
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
 def _crew_config() -> dict:
     """Read KiroCrew's own agent config (cheap, always current)."""
     try:
