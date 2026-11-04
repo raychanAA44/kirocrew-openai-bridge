@@ -115,7 +115,10 @@ if ($BaseUrl -or $ApiKey -or $Model) {
     }
     if ($DryRun) { Say "   would write $providerJson" }
     else {
-        ($cfg | ConvertTo-Json) | Set-Content -Path $providerJson -Encoding UTF8
+        # No BOM: PowerShell 5.1's Set-Content -Encoding UTF8 writes one, and a BOM
+        # makes json.load fail, which silently disables the file.
+        $json = ($cfg | ConvertTo-Json)
+        [IO.File]::WriteAllText($providerJson, $json, (New-Object Text.UTF8Encoding($false)))
         # Owner-only where the filesystem supports it.
         try { icacls $providerJson /inheritance:r /grant:r "$($env:USERNAME):(R,W)" | Out-Null } catch { }
         Say "   wrote $providerJson (model=$Model)"
@@ -145,21 +148,46 @@ else {
 }
 
 Step "Seam check"
-$probe = @'
+if ($DryRun) { Say "   (skipped in dry run)" }
+else {
+    $probePath = Join-Path $env:TEMP ("kirocrew-bridge-seam-" + [guid]::NewGuid().ToString('N') + ".py")
+    $probe = @'
 import importlib, sys
 sys.path.insert(0, r"__INSTALL_DIR__")
 import openai_provider
+from kiro_crew.config import loader
+from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.session import SessionManager
+from kiro_crew.dashboard.handlers import agents
+from openai_provider import openai_worker
 mod = importlib.import_module("openai_provider.install")
-from kiro_crew.providers.registry import ProviderRegistry
-assert hasattr(ProviderRegistry, "create_factory"), "ProviderRegistry.create_factory missing"
-assert hasattr(mod, "_build_mcp_executor"), "_build_mcp_executor missing"
-print("seams ok")
+required = {
+    "loader.build_provider_factory": hasattr(loader, "build_provider_factory"),
+    "KiroCrewConfig.create_provider_factory": hasattr(KiroCrewConfig, "create_provider_factory"),
+    "openai_worker._register_openai_worker": hasattr(openai_worker, "_register_openai_worker"),
+    "agents.api_models": hasattr(agents, "api_models"),
+    "install._build_mcp_executor": hasattr(mod, "_build_mcp_executor"),
+}
+optional = {
+    "SessionManager._bg_provider_is_kiro": hasattr(SessionManager, "_bg_provider_is_kiro"),
+}
+for name, present in required.items():
+    print(("ok " if present else "MISSING ") + name)
+for name, present in optional.items():
+    print(("ok " if present else "optional-missing ") + name)
+sys.exit(0 if all(required.values()) else 1)
 '@.Replace('__INSTALL_DIR__', $InstallDir)
-if ($DryRun) { Say "   (skipped in dry run)" }
-else {
-    $out = & $python -c $probe 2>&1
-    if ($LASTEXITCODE -ne 0) { Say "   seam check FAILED:`n$out" 'Red'; throw "incompatible KiroCrew build" }
-    Say "   $out"
+    Set-Content -Path $probePath -Value $probe -Encoding UTF8
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $out = & $python $probePath 2>&1
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = $previous
+    Remove-Item $probePath -Force -ErrorAction SilentlyContinue
+    $out | ForEach-Object {
+        if ("$_" -match '^MISSING') { Say "   $_" 'Red' } elseif ("$_" -match '^optional-missing') { Say "   $_ (feature degrades, install continues)" 'Yellow' } else { Say "   $_" }
+    }
+    if ($code -ne 0) { throw "incompatible KiroCrew build - a required seam is gone" }
 }
 
 Step "Next"

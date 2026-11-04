@@ -75,7 +75,7 @@ Most issues are "installed but not active". One command answers for all of them:
 ```
 [1] hook       hub_boot.pth + hub_boot.py present?  last inject.log line?
 [2] processes  opencode / dsh / goose child processes (expect 0)
-[3] seams      KiroCrew version + the 5 patched seams still exist?
+[3] seams      KiroCrew version + the patched seams still exist?
 [4] endpoint   GET /v1/models and one timed chat completion
 [5] tools      tool-definition count (must be > 0)
 [6] ledger     last requests: requested model == the model the UI shows?
@@ -83,6 +83,30 @@ Most issues are "installed but not active". One command answers for all of them:
 
 Point 6 is what catches the classic failure: the UI says model A while every
 request goes to model B.
+
+Real output from the dogfood machine (KiroCrew 0.11.1, Windows):
+
+```
+[3] KiroCrew seams
+    ..   version 0.11.1
+    OK   ok loader.build_provider_factory
+    OK   ok KiroCrewConfig.create_provider_factory
+    OK   ok openai_worker._register_openai_worker
+    OK   ok agents.api_models
+    OK   ok install._build_mcp_executor
+    ..   optional-missing SessionManager._bg_provider_is_kiro
+[4] configured endpoint
+    OK   GET /models -> HTTP 200
+    OK   POST /chat/completions -> HTTP 200 in 5393 ms
+[5] tool catalogue
+    OK   tool definitions: 125
+[6] ledger (requested vs served)
+    ..   served: gpt-6.1-sol | requested: regptplus/gpt-6.1-sol
+```
+
+The one `optional-missing` seam means background helpers (auto-title, link summary)
+keep their default path; sessions themselves are unaffected, and the installer
+reports it as a degradation rather than a failure.
 
 ## Compatibility
 

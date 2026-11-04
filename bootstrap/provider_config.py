@@ -27,8 +27,10 @@ _PROVIDER_PREFIXES = ("hub-neo/",)
 
 
 def _read(path: str) -> dict:
+    # utf-8-sig: Windows PowerShell 5.1 writes a BOM with Set-Content -Encoding UTF8,
+    # and a BOM makes json.load fail, which would silently ignore provider.json.
     try:
-        with open(path, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8-sig") as fh:
             doc = json.load(fh)
         return doc if isinstance(doc, dict) else {}
     except Exception:  # noqa: BLE001
@@ -78,8 +80,11 @@ def resolve() -> dict:
             cfg["model"] = model
             cfg["sources"]["model"] = "crew config.json"
 
-    cfg["base_url"] = cfg["base_url"].rstrip("/") or "http://127.0.0.1:8888/v1"
-    cfg["model"] = _strip_provider(cfg["model"]) or "gpt-4o-mini"
+    cfg["base_url"] = cfg["base_url"].strip().rstrip("/") or "http://127.0.0.1:8888/v1"
+    cfg["model"] = _strip_provider(cfg["model"].strip()) or "gpt-4o-mini"
+    # A stray newline in the key produces httpx's
+    # "Illegal header value b'Bearer '" / "invalid CRLF characters" at request time.
+    cfg["api_key"] = "".join(cfg["api_key"].split())
     return cfg
 
 
