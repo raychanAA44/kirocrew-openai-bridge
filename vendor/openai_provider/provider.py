@@ -62,6 +62,10 @@ from ._config import (
 
 logger = logging.getLogger(__name__)
 
+#: How many trailing characters stay buffered while streaming, so an inline
+#: tool-call block can still be recognised before it reaches the dashboard.
+_STREAM_GUARD_CHARS = 160
+
 #: Provider prefix KiroCrew puts in front of model ids (``hub-neo/<model>``).
 _MODEL_PREFIX = "hub-neo/"
 
@@ -108,6 +112,62 @@ def _normalise_tool_calls(calls: "list[dict]") -> "list[dict]":
             }
         )
     return out
+
+def _crew_config() -> dict:
+    """Read KiroCrew's own agent config (cheap, always current)."""
+    try:
+        with open(os.path.join(os.path.expanduser("~"), ".kiro", "crew", "config.json"),
+                  encoding="utf-8-sig") as fh:
+            return json.load(fh).get("agent") or {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _crew_model_context(model: str) -> int:
+    """Context window KiroCrew recorded for this model, or 0 when it has none.
+
+    KSWA's ``/v1/models`` carries no context field, so without this table the
+    constructor value always won and the usage meter could be off by the ratio
+    between the two windows.
+    """
+    table = _crew_config().get("model_context_tokens") or {}
+    if not isinstance(table, dict):
+        return 0
+    for key in (model, "hub-neo/" + model):
+        value = table.get(key)
+        if isinstance(value, int) and value > 0:
+            return value
+    return 0
+
+
+def _approval_timeout() -> float:
+    """KiroCrew's own tool-approval timeout, so both sides agree."""
+    try:
+        seconds = float(_crew_config().get("tool_approval_timeout_secs"))
+    except (TypeError, ValueError):
+        seconds = 600.0
+    return seconds if seconds > 0 else 600.0
+
+
+def _approval_is_auto() -> bool:
+    """True when KiroCrew is configured to auto-approve tool calls."""
+    return str(_crew_config().get("approval_mode") or "").lower() in ("auto", "yolo", "bypass")
+
+
+_IMAGES_WARNED = False
+
+
+def _warn_images_unsupported() -> None:
+    """Say it once: this provider does not forward image attachments."""
+    global _IMAGES_WARNED
+    if _IMAGES_WARNED:
+        return
+    _IMAGES_WARNED = True
+    logger.warning(
+        "openai_provider: image attachments are not forwarded (allow_image is "
+        "accepted, but the request body carries text only)"
+    )
+
 
 class OpenAIProvider(LLMProvider):
     """LLMProvider backed by an OpenAI-compatible chat-completions endpoint."""
@@ -159,6 +219,8 @@ class OpenAIProvider(LLMProvider):
         self._cancel_event: asyncio.Event = asyncio.Event()
         #: True while a turn is streaming -- steering is only accepted then.
         self._in_turn: bool = False
+        #: completion tokens of the last turn (reported, not part of context used)
+        self._completion_tokens: int = 0
         self._alive: bool = False
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
@@ -184,6 +246,14 @@ class OpenAIProvider(LLMProvider):
           5. Fallback to ``max_tokens``
         """
         import httpx
+
+        # Priority 0.5: the table KiroCrew maintains per model
+        # (agent.model_context_tokens). KSWA's /v1/models carries no context
+        # field, so without this the constructor value always won.
+        crew_ctx = _crew_model_context(self._model)
+        if crew_ctx:
+            self._context_window = crew_ctx
+            return
 
         # Priority 1: explicit override (already set in __init__)
         if self._context_window > 0:
@@ -297,7 +367,9 @@ class OpenAIProvider(LLMProvider):
 
         # Estimate current usage: count tokens in all messages (rough: 4 chars ≈ 1 token)
         total_chars = sum(len(str(m.get("content", ""))) + len(str(m.get("tool_calls", ""))) for m in self._messages)
-        estimated_tokens = total_chars // 4
+        # 中文约 1.7 字符/token，按 4 字符/token 会低报约 2.7 倍，压缩触发太晚。
+        # 有真实 usage 时直接用最近一次的 prompt_tokens（_context_used 只含输入）。
+        estimated_tokens = int(self._context_used) or int(total_chars / 1.7)
         pct = min(estimated_tokens / ctx_win * 100, 100.0)
 
         if pct < self._compaction_threshold:
@@ -571,6 +643,8 @@ class OpenAIProvider(LLMProvider):
         builds pass (``allow_image``, ...). Without it every turn dies with
         ``TypeError: stream() got an unexpected keyword argument``.
         """
+        if kwargs.get("allow_image"):
+            _warn_images_unsupported()
         self._cancel_event.clear()
         self._in_turn = True
         self._messages.append({"role": "user", "content": message})
@@ -630,9 +704,20 @@ class OpenAIProvider(LLMProvider):
                 if event.kind == EVENT_THINKING_CHUNK:
                     yield event
                     continue
-                # Text chunks: buffer — we don't know yet if this precedes a tool call
+                # Text chunks: emit as they arrive, holding back a small tail so an
+                # inline tool-call block still has a chance to be recognised before it
+                # reaches the dashboard. Buffering the entire turn here made a genuinely
+                # streaming upstream look non-streaming: the gateway reported first
+                # token 1.08 s / total 10.46 s, yet the UI only got text at the end.
                 if event.kind == EVENT_TEXT_CHUNK:
                     text_buffer.append(event)
+                    pending = "".join(e.text for e in text_buffer)
+                    if len(pending) > _STREAM_GUARD_CHARS:
+                        tail = pending[-_STREAM_GUARD_CHARS:]
+                        safe = pending[:-_STREAM_GUARD_CHARS]
+                        text_buffer = [AcpEvent(kind=EVENT_TEXT_CHUNK, text=tail)]
+                        if safe:
+                            yield AcpEvent(kind=EVENT_TEXT_CHUNK, text=safe)
                     continue
                 # Everything else (rare in _stream_completion): buffer too
                 other_events.append(event)
@@ -747,6 +832,13 @@ class OpenAIProvider(LLMProvider):
 
                 async for line in resp.aiter_lines():
                     if self._cancel_event.is_set():
+                        # Close the upstream response so we stop pulling tokens that
+                        # the UI will never show. (The provider may still bill what
+                        # it already generated -- that is server-side.)
+                        try:
+                            await resp.aclose()
+                        except Exception:  # noqa: BLE001
+                            pass
                         return
 
                     if not line.startswith("data: "):
@@ -762,10 +854,14 @@ class OpenAIProvider(LLMProvider):
 
                     # Usage (last chunk on many providers)
                     if usage := chunk.get("usage"):
-                        pt = usage.get("prompt_tokens", 0)
-                        ct = usage.get("completion_tokens", 0)
-                        total = pt + ct
-                        self._context_used = total
+                        pt = int(usage.get("prompt_tokens") or 0)
+                        ct = int(usage.get("completion_tokens") or 0)
+                        # "Context used" is what the NEXT request has to carry: the
+                        # prompt. Adding completion_tokens reported the model's own
+                        # output as if it occupied the window, so the meter ran ahead
+                        # of reality by one answer every turn.
+                        self._context_used = pt
+                        self._completion_tokens = ct
                         # Use resolved context_window for percentage calc (not max_tokens!)
                         ctx_win = self._context_window or self._max_tokens
                         if ctx_win:
@@ -863,7 +959,10 @@ class OpenAIProvider(LLMProvider):
         )
 
         try:
-            approved = await asyncio.wait_for(fut, timeout=120.0)
+            if _approval_is_auto():
+                approved = True
+            else:
+                approved = await asyncio.wait_for(fut, timeout=_approval_timeout())
         except asyncio.TimeoutError:
             approved = False
         finally:
