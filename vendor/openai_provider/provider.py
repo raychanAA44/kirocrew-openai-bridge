@@ -81,6 +81,33 @@ def _bare_model(model: str | None) -> str:
 _PENDING_APPROVALS: dict[str, asyncio.Future] = {}
 
 
+def _normalise_tool_calls(calls: "list[dict]") -> "list[dict]":
+    """Return tool calls in the exact shape an OpenAI server accepts back.
+
+    The stream hands over deltas that carry stream-only fields (``index``) and may
+    omit ``type``. Echoing them verbatim makes strict servers lose the pairing
+    between a call and its ``tool`` result, and the model then repeats the same
+    call forever -- visible as a subagent spinning through dozens of identical
+    turns.
+    """
+    out: list[dict] = []
+    for call in calls or []:
+        fn = call.get("function") or {}
+        name = fn.get("name") or call.get("name") or ""
+        args = fn.get("arguments")
+        if args is None:
+            args = "{}"
+        if not isinstance(args, str):
+            args = json.dumps(args, ensure_ascii=False)
+        out.append(
+            {
+                "id": call.get("id") or "",
+                "type": "function",
+                "function": {"name": name, "arguments": args},
+            }
+        )
+    return out
+
 class OpenAIProvider(LLMProvider):
     """LLMProvider backed by an OpenAI-compatible chat-completions endpoint."""
 
@@ -633,12 +660,11 @@ class OpenAIProvider(LLMProvider):
                             tool_results.append({
                                 "tool_call_id": tc["id"],
                                 "role": "tool",
-                                "content": ev.tool_output,
+                                "content": ev.tool_output if isinstance(ev.tool_output, str) else json.dumps(ev.tool_output, ensure_ascii=False),
                             })
                 # Add assistant tool-call turn + results to history
                 self._messages.append({
-                    "role": "assistant",
-                    "tool_calls": tool_calls_made,
+                    "role": "assistant", "content": "", "tool_calls": _normalise_tool_calls(tool_calls_made),
                 })
                 self._messages.extend(tool_results)
                 # Loop: send results back to model
@@ -662,9 +688,9 @@ class OpenAIProvider(LLMProvider):
                             tool_results.append({
                                 "tool_call_id": tc["id"],
                                 "role": "tool",
-                                "content": ev.tool_output,
+                                "content": ev.tool_output if isinstance(ev.tool_output, str) else json.dumps(ev.tool_output, ensure_ascii=False),
                             })
-                self._messages.append({"role": "assistant", "tool_calls": tool_calls_made})
+                self._messages.append({"role": "assistant", "content": "", "tool_calls": _normalise_tool_calls(tool_calls_made)})
                 self._messages.extend(tool_results)
                 continue
 
