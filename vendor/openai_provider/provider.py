@@ -878,9 +878,26 @@ class OpenAIProvider(LLMProvider):
             )
             return
 
-        # Execute the tool
+        # Execute the tool. KiroCrew's tools resolve "which session am I in" through
+        # mcp_core._resolve_session_key(): caller context, signed token, then
+        # KIROCREW_SESSION_KEY, then a pid mapping. In-process execution has none of
+        # the first three and no pid of its own, so spawn_run stored an empty
+        # parent_session and the dashboard could not attribute the subagent to any
+        # chat -- the right-hand subagent list stayed empty. Publish the key for the
+        # duration of the call (level 3 of that ladder).
+        _prior_session_key = os.environ.get("KIROCREW_SESSION_KEY")
+        _published_session_key = bool(self._session_key)
+        if _published_session_key:
+            os.environ["KIROCREW_SESSION_KEY"] = str(self._session_key)
         try:
-            result = await self._tool_executor.execute(fn_name, fn_args)
+            try:
+                result = await self._tool_executor.execute(fn_name, fn_args)
+            finally:
+                if _published_session_key:
+                    if _prior_session_key is None:
+                        os.environ.pop("KIROCREW_SESSION_KEY", None)
+                    else:
+                        os.environ["KIROCREW_SESSION_KEY"] = _prior_session_key
         except Exception as exc:
             result = f"[Tool error: {exc}]"
             logger.exception("Tool %s raised", fn_name)
