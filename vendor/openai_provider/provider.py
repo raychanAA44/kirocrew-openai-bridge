@@ -165,6 +165,26 @@ _EFFORT_SUPPORT: dict[str, tuple[str, ...]] = {
 }
 
 
+def _effort_levels_for(model: str) -> tuple[str, ...]:
+    """The effort levels *model* is documented to accept, or () if none.
+
+    Exact id first, then the longest family prefix that matches, so
+    ``deepseek-v4.1-flash:1017`` still resolves to its family entry.
+    """
+    bare = str(model or "").rsplit("/", 1)[-1].strip().lower()
+    if not bare:
+        return ()
+    levels = _EFFORT_SUPPORT.get(bare)
+    if levels is not None:
+        return levels
+    best: tuple[str, ...] = ()
+    best_len = 0
+    for family, supported in _EFFORT_SUPPORT.items():
+        if bare.startswith(family) and len(family) > best_len:
+            best, best_len = supported, len(family)
+    return best
+
+
 def _effort_for_model(model: str, explicit: "str | None") -> str:
     """The ``reasoning_effort`` to send for *model*, or "" to send none.
 
@@ -173,23 +193,13 @@ def _effort_for_model(model: str, explicit: "str | None") -> str:
     THIS model documents the level, so a chat-level setting never leaks onto a
     subagent route that would reject it.
     """
-    bare = str(model or "").rsplit("/", 1)[-1].strip().lower()
-    if not bare:
-        return ""
-    allowed = _EFFORT_SUPPORT.get(bare)
-    if allowed is None:
-        for family, levels in _EFFORT_SUPPORT.items():
-            if bare.startswith(family):
-                allowed = levels
-                break
-    if allowed is None:
+    allowed = _effort_levels_for(model)
+    if not allowed:
         return ""
     want = str(explicit or "").strip().lower()
     if not want:
         want = str(_crew_config().get("reasoning_effort") or "").strip().lower()
-    if not want or want not in allowed:
-        return ""
-    return want
+    return want if want in allowed else ""
 
 
 def _crew_model_context(model: str) -> int:
@@ -440,6 +450,34 @@ class OpenAIProvider(LLMProvider):
 
     def context_used_tokens(self) -> int:
         return self._context_used
+
+    #: This provider answers ``supports_effort()`` from the LIVE model, so KiroCrew
+    #: may act on a False from it as a real "not supported" rather than a
+    #: placeholder. Without this flag the dashboard treats the answer as "no
+    #: information" and never offers the effort control at all.
+    reports_effort_support = True
+
+    def supports_effort(self) -> bool:
+        """True when the model this provider serves accepts a reasoning level."""
+        return bool(_effort_levels_for(self._model))
+
+    def get_valid_effort_levels(self) -> list[str]:
+        """The levels this model accepts, in the order the picker should show them."""
+        return list(_effort_levels_for(self._model))
+
+    async def change_effort(self, level: str) -> bool:
+        """Apply *level* to subsequent requests, live.
+
+        Returns False for a level this model does not document, so KiroCrew takes
+        its reset path instead of recording a level that would be dropped on the
+        wire anyway. An empty *level* clears the override (model default).
+        """
+        want = str(level or "").strip().lower()
+        allowed = _effort_levels_for(self._model)
+        if want and want not in allowed:
+            return False
+        self._reasoning_effort = want
+        return True
 
     def context_window_tokens(self) -> int:
         return self._context_window or self._max_tokens
