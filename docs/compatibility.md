@@ -57,6 +57,24 @@ KiroCrew's strong sandbox needs cgroups (Linux). On Windows only backends listed
 `tool_gate._LOCAL_UNENFORCED_BACKENDS` skip enforcement. That is a KiroCrew-side patch,
 not part of this bridge — see `docs/architecture.md` and your KiroCrew setup notes.
 
+### A model answers the first turn, then the session hangs (~2 min) and fails
+
+Example: `claude-sonnet-5-5 does not support non-default temperature` (HTTP 400).
+
+Some models reject sampling parameters. The vendored provider used to send
+`temperature` on every request; it now sends it **only when a caller passes one**.
+If you hit this on another parameter (`top_p`, `max_tokens` on a reasoning model,
+...), set it to `null`/omit it in the request path the same way — a 400 that the
+gateway queues can look like a hang, because the failure only surfaces when the
+client timeout fires.
+
+### The first message after picking a model still uses the old one
+
+KiroCrew applies a model pick at the **turn boundary**: a pick made while a turn is
+in flight is committed and applied to the next message. The bridge logs both sides
+(`live model switch -> <model>` and `factory session=… -> <model>`), so the ordering
+is visible in `inject.log`.
+
 ## Getting a useful bug report
 
 ```

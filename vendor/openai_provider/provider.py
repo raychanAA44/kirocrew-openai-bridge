@@ -93,7 +93,7 @@ class OpenAIProvider(LLMProvider):
         system_prompt: str = "",
         max_tokens: int = DEFAULT_MAX_TOKENS,
         context_window: int | None = None,
-        temperature: float = DEFAULT_TEMPERATURE,
+        temperature: float | None = None,
         tool_executor: "ToolExecutor | None" = None,
         session_key: str | None = None,
         compaction_threshold: int = DEFAULT_COMPACTION_THRESHOLD,
