@@ -565,6 +565,14 @@ class McpToolExecutor(ToolExecutor):
             return ""  # local handler, no MCP server
         return _tool_server_map.get(tool_name, "")
 
+    def handler_definition(self, tool_name: str) -> dict | None:
+        """The wire definition of a tool this build implements locally."""
+        from .mcp_handler_registry import McpHandlerRegistry
+        try:
+            return McpHandlerRegistry.definition_for(tool_name)
+        except Exception:  # noqa: BLE001
+            return None
+
     def routable_names(self) -> set[str]:
         """Every tool name this build can actually execute.
 

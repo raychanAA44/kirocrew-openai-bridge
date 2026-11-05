@@ -193,6 +193,11 @@ _CORE_TOOL_NAMES = frozenset({
 
 _TOOL_SEARCH_NAME = "tool_search"
 
+#: Tools THIS build implements but crew does not advertise (crew sends only what
+#: its configured MCP servers declare plus the kiro-cli built-ins). A handler with
+#: no definition on the wire is unreachable: the model cannot call what it cannot
+#: see, so these are appended to every request instead of being deferred.
+_BRIDGE_ONLY_TOOLS = ("session_create", "spawn_run", "spawn_list", "spawn_status")
 _TOOL_SEARCH_DEF = {
     "type": "function",
     "function": {
@@ -1065,6 +1070,7 @@ class OpenAIProvider(LLMProvider):
         if len(core) + len(loaded) >= len(tools):
             return tools
         sent = core + loaded + [_TOOL_SEARCH_DEF]
+        sent = sent + self._bridge_only_defs({_tool_name(t) for t in sent})
         _trace(
             "tools",
             sent=len(sent),
@@ -1072,6 +1078,32 @@ class OpenAIProvider(LLMProvider):
             chars=sum(len(json.dumps(t, ensure_ascii=False)) for t in sent),
         )
         return sent
+
+    def _bridge_only_defs(self, present: set[str]) -> list[dict]:
+        """Definitions for tools THIS build implements and crew never offers.
+
+        crew advertises what its configured MCP servers declare plus the kiro-cli
+        built-ins -- 125 names here -- and nothing else. So a tool the bridge
+        implements itself (session_create, spawn_run, spawn_list, spawn_status)
+        has a working handler and is still uncallable, because it is not on the
+        wire at all. They are appended rather than deferred: each is small, and
+        a tool the model cannot see is a tool that does not exist.
+        """
+        out: list[dict] = []
+        executor = getattr(self, "_tool_executor", None)
+        getter = getattr(executor, "handler_definition", None)
+        if getter is None:
+            return out
+        for name in _BRIDGE_ONLY_TOOLS:
+            if name in present:
+                continue
+            try:
+                definition = getter(name)
+            except Exception:  # noqa: BLE001
+                definition = None
+            if isinstance(definition, dict) and definition.get("function"):
+                out.append(definition)
+        return out
 
     def _load_tools(self, names: list[str], query: str) -> str:
         """Activate tools named in *names* or matched by *query*; say what loaded.
