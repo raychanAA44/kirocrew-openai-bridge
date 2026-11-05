@@ -63,6 +63,13 @@ def resolve() -> dict:
 
     cfg: dict = {
         "base_url": str(os.environ.get("OPENAI_BASE_URL") or own.get("base_url") or ""),
+        # Second endpoint for the read-only catalog fetch (see provider._endpoints).
+        # A deployment that reaches the gateway over the public HTTPS entry keeps
+        # the local SSH tunnel here; "primary down" then costs a list refresh, not
+        # an empty picker.
+        "fallback_base_url": str(
+            os.environ.get("OPENAI_FALLBACK_BASE_URL") or own.get("fallback_base_url") or ""
+        ),
         "model": str(os.environ.get("OPENAI_MODEL") or own.get("model") or ""),
         "api_key": str(os.environ.get("OPENAI_API_KEY") or own.get("api_key") or ""),
         "max_tokens": int(os.environ.get("OPENAI_MAX_TOKENS") or own.get("max_tokens") or 32768),
@@ -98,6 +105,13 @@ def resolve() -> dict:
         if model:
             cfg["model"] = model
             cfg["sources"]["model"] = "crew config.json"
+    if not cfg["reasoning_effort"]:
+        # The default level when a spawn carries no per-session override: read the
+        # same field the dashboard writes, so the UI and the wire cannot disagree.
+        effort = str(((_read(CREW_JSON).get("agent") or {}).get("reasoning_effort") or "")).strip()
+        if effort:
+            cfg["reasoning_effort"] = effort.lower()
+            cfg["sources"]["reasoning_effort"] = "crew config.json"
 
     # These two are what a FRESH install lands on when nothing else is configured,
     # and the old pair was a trap: 8888 was a gateway that rejects this key, and
@@ -105,6 +119,7 @@ def resolve() -> dict:
     # with "Illegal header value" or "Model is unavailable" and nothing said why.
     # A working default matters more than a generic-looking one.
     cfg["base_url"] = cfg["base_url"].strip().rstrip("/") or "http://127.0.0.1:28791/v1"
+    cfg["fallback_base_url"] = cfg["fallback_base_url"].strip().rstrip("/")
     cfg["model"] = _strip_provider(cfg["model"].strip()) or "oc/beam-free"
 
     # A key that is not a key (whole JSON pasted in, stray newline, ...) produces
@@ -128,6 +143,8 @@ def as_env(cfg: dict | None = None) -> dict:
         "OPENAI_MAX_TOKENS": str(cfg["max_tokens"]),
         "OPENAI_CONTEXT_WINDOW": str(cfg["context_window"]),
     }
+    if cfg.get("fallback_base_url"):
+        env["OPENAI_FALLBACK_BASE_URL"] = cfg["fallback_base_url"]
     if cfg.get("reasoning_effort"):
         env["OPENAI_REASONING_EFFORT"] = cfg["reasoning_effort"]
     return env

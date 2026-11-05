@@ -1,6 +1,7 @@
 {
-  "_comment": "Written by install.ps1 / install.sh. Environment variables win over these values.",
+  "_comment": "Written by install.ps1 / install.sh. Environment variables win over these values. base_url is the endpoint chat goes to; fallback_base_url is only read when the model catalog cannot be fetched from the primary, so the picker survives a dead primary.",
   "base_url": "http://127.0.0.1:28791/v1",
+  "fallback_base_url": "",
   "api_key": "",
   "model": "oc/beam-free",
   "max_tokens": 32768,

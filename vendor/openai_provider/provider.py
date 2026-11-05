@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import re as _re
+import threading
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -80,6 +81,16 @@ def _bare_model(model: str | None) -> str:
     """
     name = (model or "").strip()
     return name[len(_MODEL_PREFIX):] if name.startswith(_MODEL_PREFIX) else name
+
+
+# ── Shared HTTP client ───────────────────────────────────────────────────────
+#
+# A process-wide ``httpx.AsyncClient`` was tried and REVERTED: it saved the
+# measured 29.9 ms of per-turn client setup, but the gateway instance running it
+# died once with no traceback while two large streams were in flight, and a
+# client created on one event loop is not safe to reuse if the loop is ever
+# replaced. 30 ms is not worth an unexplained exit -- keep a client per request.
+
 
 # ── Tool execution registry ──────────────────────────────────────────────────
 # Holds pending tool calls waiting for KiroCrew's approve/reject signal.
@@ -177,6 +188,130 @@ _CATALOG_CACHE: tuple[float, dict] = (0.0, {})
 #: exist right now, and only the gateway knows the second.
 _AVAILABLE_CACHE: tuple[float, list] = (0.0, [])
 _AVAILABLE_TTL = 60.0
+
+#: Guards against a refresh stampede: several slots ask for the catalog within
+#: the same second, and one background refresh answers all of them.
+_AVAILABLE_REFRESH_LOCK = threading.Lock()
+
+_SNAPSHOT_NAME = "models_snapshot.json"
+
+
+def _snapshot_path() -> str:
+    return os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), _SNAPSHOT_NAME,
+    )
+
+
+def _snapshot_rows() -> list[dict[str, str]]:
+    """Bare ids from the catalog snapshot ``install.py`` keeps on disk.
+
+    Serving this first is what keeps a new session fast (the live fetch costs
+    ~650 ms) AND what keeps the picker populated when the upstream is
+    unreachable. It is the last list the gateway actually served, not a guess.
+    """
+    try:
+        with open(_snapshot_path(), encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    ids = payload.get("ids") if isinstance(payload, dict) else payload
+    if not isinstance(ids, list):
+        return []
+    return [
+        {"modelId": str(i).strip(), "name": str(i).strip()}
+        for i in ids
+        if isinstance(i, str) and str(i).strip()
+    ]
+
+
+def _fetch_available_rows(endpoints: list[str], api_key: str) -> list[dict[str, str]]:
+    """One synchronous walk of *endpoints* for ``/models``; ``[]`` on failure.
+
+    Primary first, then the optional fallback: when the public HTTPS entry is
+    down but the local tunnel is alive (or the reverse), the picker still lists
+    the real catalog instead of going blank.
+    """
+    import urllib.request
+
+    for endpoint in endpoints:
+        try:
+            req = urllib.request.Request(
+                f"{endpoint}/models",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Accept": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=3) as resp:  # noqa: S310 - local gateway
+                payload = json.loads(resp.read(4 << 20).decode("utf-8", "replace")) or {}
+        except Exception:  # noqa: BLE001
+            continue
+        rows: list[dict[str, str]] = []
+        for row in payload.get("data") or []:
+            if not isinstance(row, dict):
+                continue
+            mid = str(row.get("id") or "").strip()
+            # ``decision`` rows are router internals, not chat models; listing
+            # them only offers the user a pick that cannot answer.
+            if not mid or row.get("decision"):
+                continue
+            rows.append({"modelId": mid, "name": str(row.get("name") or mid)})
+        if rows:
+            return rows
+    return []
+
+
+def _refresh_available_models_async(provider: Any) -> None:
+    """Refresh the catalog cache off-thread; at most one refresh in flight."""
+    if not _AVAILABLE_REFRESH_LOCK.acquire(blocking=False):
+        return
+
+    def _run() -> None:
+        global _AVAILABLE_CACHE
+        try:
+            rows = _fetch_available_rows(provider._endpoints(), provider._api_key)
+            if rows:
+                _AVAILABLE_CACHE = (time.time(), rows)
+        except Exception:  # noqa: BLE001
+            logger.debug("catalog refresh failed", exc_info=True)
+        finally:
+            _AVAILABLE_REFRESH_LOCK.release()
+
+    try:
+        threading.Thread(target=_run, name="hub-neo-models-refresh", daemon=True).start()
+    except RuntimeError:  # noqa: BLE001 - interpreter shutting down
+        _AVAILABLE_REFRESH_LOCK.release()
+
+
+def _is_loopback(url: str) -> bool:
+    """True for a URL that points at this machine (the local SSH tunnel)."""
+    return "127.0.0.1" in url or "localhost" in url or "[::1]" in url
+
+
+def _port_open(url: str, timeout: float = 0.25) -> bool:
+    """True when *url*'s host:port accepts a TCP connection right now.
+
+    A refused connect on loopback returns immediately, so this is a sub-
+    millisecond test on Windows and never the 0.25 s budget it is given.
+    """
+    import socket
+    import urllib.parse
+
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        host = parsed.hostname or ""
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        if not host:
+            return False
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+#: ``(stamped, key, chosen)`` for :meth:`OpenAIProvider._chat_base_url`.
+_CHAT_BASE_CACHE: tuple[float, str, str] = (0.0, "", "")
+_CHAT_PROBE_TTL = 5.0
 
 
 def _catalog() -> dict:
@@ -361,6 +496,7 @@ class OpenAIProvider(LLMProvider):
         self,
         *,
         base_url: str | None = None,
+        fallback_base_url: str | None = None,
         api_key: str | None = None,
         model: str = DEFAULT_MODEL,
         system_prompt: str = "",
@@ -374,7 +510,15 @@ class OpenAIProvider(LLMProvider):
         compaction_threshold: int = DEFAULT_COMPACTION_THRESHOLD,
         compaction_keep_recent: int = DEFAULT_COMPACTION_KEEP_RECENT,
     ) -> None:
-        self._base_url = base_url or read_env_str("OPENAI_BASE_URL", DEFAULT_BASE_URL)
+        self._base_url = (base_url or read_env_str("OPENAI_BASE_URL", DEFAULT_BASE_URL)).rstrip("/")
+        # Optional second endpoint, tried once when the primary answers a retryable
+        # status (429 rate limit / 503 "busy" from the public TLS facade) or drops
+        # the connection. Deployments that reach the gateway over the public HTTPS
+        # entry keep the local SSH tunnel here, so a burst that exceeds the facade's
+        # concurrency cap falls back instead of failing the turn.
+        self._fallback_base_url = (
+            fallback_base_url or read_env_str("OPENAI_FALLBACK_BASE_URL")
+        ).rstrip("/")
         self._api_key = api_key or read_env_str("OPENAI_API_KEY")
         self._model = _bare_model(model)
         self._system_prompt = system_prompt
@@ -557,6 +701,18 @@ class OpenAIProvider(LLMProvider):
         """The levels this model accepts, in the order the picker should show them."""
         return list(_effort_levels_for(self._model))
 
+    def accepts_effort_level(self, level: str) -> bool:
+        """Whether *level* would be sent for this model (used by the effort route).
+
+        KiroCrew asks this before pushing a level live, so answering it here is
+        what lets the dashboard change the level on a running session without
+        tearing it down (a teardown rebuilt the session on the configured
+        DEFAULT model, i.e. an effort tweak silently moved the chat onto a
+        different, possibly paid, model).
+        """
+        want = str(level or "").strip().lower()
+        return not want or want in _effort_levels_for(self._model)
+
     async def change_effort(self, level: str) -> bool:
         """Apply *level* to subsequent requests, live.
 
@@ -600,6 +756,52 @@ class OpenAIProvider(LLMProvider):
     def context_window_tokens(self) -> int:
         return self._context_window or self._max_tokens
 
+    def _endpoints(self) -> list[str]:
+        """The base URLs this provider may talk to, best-first.
+
+        The CHAT endpoint is chosen per turn by :meth:`_chat_base_url` (local
+        tunnel when it answers, public HTTPS otherwise); this list only orders
+        the catalog walk and reuses that same choice first.
+        """
+        out: list[str] = []
+        for candidate in (
+            self._chat_base_url(),
+            self._base_url,
+            (getattr(self, "_fallback_base_url", "") or "").rstrip("/"),
+        ):
+            if candidate and candidate not in out:
+                out.append(candidate)
+        return out
+
+    def _chat_base_url(self) -> str:
+        """Which endpoint this turn's chat request goes to.
+
+        Two endpoints, opposite trade-offs. The local SSH tunnel reaches the
+        gateway one hop closer: measured TTFB 3 184.9 ms over the public TLS
+        facade against 2 693.3 ms through the tunnel for the same 118 KB payload,
+        because the facade terminates TLS and re-forwards. The public endpoint,
+        though, is the DURABLE one -- it needs no OPS/control.mjs process to be
+        alive, and a cold DNS lookup there can cost seconds.
+
+        So the tunnel wins whenever it actually answers, and the public endpoint
+        is the fallback the moment it does not. The probe is a loopback TCP
+        connect (~0.2 ms) cached for 5 s, i.e. re-decided roughly once per turn,
+        which is what makes "OPS closed mid-session" degrade to the slower-but-
+        working path instead of failing the turn.
+        """
+        local = (getattr(self, "_fallback_base_url", "") or "").rstrip("/")
+        if not local or local == self._base_url or not _is_loopback(local):
+            return self._base_url
+        global _CHAT_BASE_CACHE
+        key = f"{self._base_url}|{local}"
+        stamped, cached_key, chosen = _CHAT_BASE_CACHE
+        now = time.time()
+        if cached_key == key and now - stamped < _CHAT_PROBE_TTL and chosen:
+            return chosen
+        chosen = local if _port_open(local) else self._base_url
+        _CHAT_BASE_CACHE = (now, key, chosen)
+        return chosen
+
     def available_models(self) -> list[dict[str, str]]:
         """The models the gateway actually serves, for KiroCrew's picker.
 
@@ -608,48 +810,40 @@ class OpenAIProvider(LLMProvider):
         is answered by the gateway's DEFAULT model, i.e. the UI says one thing and
         another model answers.
 
-        Ids carry the ``hub-neo/`` prefix KiroCrew routes through this provider;
-        ``_bare_model`` strips it again on the way out to the wire.
+        Ids are the gateway's own BARE ids, the same spelling ``/api/models``
+        serves (install._fetch_upstream_models) and the same one
+        ``model_registry.to_acp_id`` sends on the wire. They used to carry the
+        ``hub-neo/`` provider prefix, which broke KiroCrew's entitlement check:
+        ``acp.runtime_models.model_is_unusable`` is a literal membership test, so
+        every BARE pin (``ollama/deepseek-v4.1-flash:1017``, ``oc/beam-free``)
+        came back unusable and the UI announced "… isn't offered right now" while
+        the gateway served it happily.
 
-        Synchronous by design: the callers are sync accessors, the listener is
-        local, and a stale answer beats blocking a request handler on a retry.
+        Synchronous by design: the callers are sync accessors (KiroCrew's slot
+        entitlements, its wire-id fold), the listener is local, and a stale
+        answer beats blocking a request handler on a retry. A stale-but-known
+        answer therefore wins over a fresh one: this method returns the last
+        good list at once and refreshes it on a daemon thread, so a session
+        never waits ~650 ms for a catalog it already has on disk.
         """
         global _AVAILABLE_CACHE
         now = time.time()
         stamped, cached = _AVAILABLE_CACHE
         if stamped and now - stamped < _AVAILABLE_TTL and cached:
             return cached
-        rows: list[dict[str, str]] = []
-        try:
-            import urllib.request
 
-            req = urllib.request.Request(
-                f"{self._base_url}/models",
-                headers={
-                    "Authorization": f"Bearer {self._api_key}",
-                    "Accept": "application/json",
-                },
-            )
-            with urllib.request.urlopen(req, timeout=3) as resp:  # noqa: S310 - local gateway
-                payload = json.loads(resp.read(4 << 20).decode("utf-8", "replace")) or {}
-            for row in payload.get("data") or []:
-                if not isinstance(row, dict):
-                    continue
-                mid = str(row.get("id") or "").strip()
-                # ``decision`` rows are router internals, not chat models; listing
-                # them only offers the user a pick that cannot answer.
-                if not mid or row.get("decision"):
-                    continue
-                rows.append({"modelId": _MODEL_PREFIX + mid, "name": str(row.get("name") or mid)})
-        except Exception:  # noqa: BLE001
-            # Gateway unreachable: keep the last good answer rather than emptying
-            # the picker, and seed from the file catalog if there has never been one.
-            if cached:
-                return cached
-            return [{"modelId": _MODEL_PREFIX + k, "name": k} for k in sorted(_catalog())]
+        seeded = cached or _snapshot_rows()
+        if seeded:
+            _refresh_available_models_async(self)
+            return seeded
+
+        rows = _fetch_available_rows(self._endpoints(), self._api_key)
         if rows:
             _AVAILABLE_CACHE = (now, rows)
-        return rows or cached
+            return rows
+        # Nothing local and nothing reachable: the file catalog is still better
+        # than an empty picker (and this path is first-run only).
+        return [{"modelId": k, "name": k} for k in sorted(_catalog())]
 
     @property
     def served_model(self) -> str:
@@ -807,7 +1001,7 @@ class OpenAIProvider(LLMProvider):
 
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(
-                f"{self._base_url}/chat/completions",
+                f"{self._chat_base_url()}/chat/completions",
                 json=payload,
                 headers=headers,
             )
@@ -1189,7 +1383,7 @@ class OpenAIProvider(LLMProvider):
         async with httpx.AsyncClient(timeout=120.0) as client:
             async with client.stream(
                 "POST",
-                f"{self._base_url}/chat/completions",
+                f"{self._chat_base_url()}/chat/completions",
                 json=payload,
                 headers=headers,
             ) as resp:

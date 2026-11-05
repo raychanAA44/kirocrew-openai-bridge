@@ -253,8 +253,18 @@ def _register_openai_worker() -> None:
         _orig_create_worker = LLMPool._create_worker
 
         async def _patched_create_worker(self: Any) -> Any:
-            """Use ``OpenAIWorker`` when ``provider_type`` is ``'openai'``."""
-            if self._provider_type == "openai":
+            """Use ``OpenAIWorker`` for the bridge's own deployments too.
+
+            The gate used to accept only ``provider_type == "openai"``, but the
+            value is read from ``agent.provider`` (``llm_pool._get_provider_type``)
+            and this bridge keeps that at ``"acp"`` -- so the patch installed,
+            logged success, and then never matched. Every knowledge-extraction
+            worker therefore spawned a REAL ACP harness (opencode), which cannot
+            resolve this deployment's bare model ids: ``-32602 model not found``
+            five times per three minutes, one subprocess each. ``"acp"`` is as
+            HTTP-backed as ``"openai"`` once this bridge is installed.
+            """
+            if self._provider_type in ("openai", "acp"):
                 worker = OpenAIWorker()
                 await worker.start()
                 return worker

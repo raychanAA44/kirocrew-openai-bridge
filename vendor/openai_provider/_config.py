@@ -93,14 +93,22 @@ def read_env_int(name: str, default: int = 0) -> int:
 def read_provider_config() -> dict[str, Any]:
     """Read provider configuration from environment variables.
 
-    Returns a dict with keys: ``base_url``, ``api_key``, ``model``,
-    ``max_tokens``, ``context_window``, ``system_prompt``,
+    Returns a dict with keys: ``base_url``, ``fallback_base_url``, ``api_key``,
+    ``model``, ``max_tokens``, ``context_window``, ``system_prompt``,
     ``compaction_threshold``, ``compaction_keep_recent``.
     """
     return {
         "base_url": read_env_str("OPENAI_BASE_URL", DEFAULT_BASE_URL),
+        # The bridge's second endpoint (see provider._chat_base_url): present here
+        # because ``install()`` builds every provider from THIS dict -- a key
+        # missing here is a key the provider can never see, however carefully
+        # provider.json and provider_config.py spell it.
+        "fallback_base_url": read_env_str("OPENAI_FALLBACK_BASE_URL"),
         "api_key": read_env_str("OPENAI_API_KEY"),
         "model": read_env_str("OPENAI_MODEL", DEFAULT_MODEL),
+        # Default reasoning level when the caller passes no per-session override.
+        # Written by provider_config.as_env from crew's agent.reasoning_effort.
+        "reasoning_effort": read_env_str("OPENAI_REASONING_EFFORT").strip().lower(),
         "max_tokens": read_env_int("OPENAI_MAX_TOKENS", DEFAULT_MAX_TOKENS),
         "context_window": read_env_int("OPENAI_CONTEXT_WINDOW") or None,
         "system_prompt": read_env_str("OPENAI_SYSTEM_PROMPT"),

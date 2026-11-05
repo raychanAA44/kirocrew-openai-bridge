@@ -20,7 +20,10 @@ Environment variables (read at ``install()`` time):
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import time
 from typing import Any, Callable
 
 from ._config import read_provider_config
@@ -35,8 +38,19 @@ _installed = False
 # receives "auto" (or similar) and returns 404 "model_not_found".
 _MODEL_SENTINELS = frozenset({"auto", ""})
 
-# Timeout for upstream /v1/models HTTP requests (seconds).
-_UPSTREAM_MODELS_TIMEOUT = 10.0
+# How long the catalog fetch may block the ``/api/models`` handler. One HTTP
+# round trip through the operator's proxy costs DNS+CONNECT+TLS on a cold
+# start (measured 505 ms, one cold-DNS case at 18 s), so 2 s was too tight for
+# the proxy path; 5 s still fails fast against a dead endpoint while giving a
+# cold proxy the time it needs. The result is cached for 60 s either way.
+_UPSTREAM_MODELS_TIMEOUT = 5.0
+
+#: Bare model ids from the last SUCCESSFUL catalog fetch, replayed when the
+#: upstream is unreachable — OPS/``control.mjs`` closed, ssh tunnel dead, or the
+#: app restarted before the tunnel came back. Without this the handler degraded
+#: to the stock kiro-cli catalog (KiroCrew's BUILT-IN list), which is exactly the
+#: "cloud models only appear while OPS is running" symptom.
+_SNAPSHOT_NAME = "models_snapshot.json"
 
 
 def install(
@@ -99,6 +113,7 @@ def install(
         executor = tool_executor or _build_mcp_executor()
         return OpenAIProvider(
             base_url=cfg["base_url"],
+            fallback_base_url=cfg.get("fallback_base_url", ""),
             api_key=cfg["api_key"],
             model=used_model,
             system_prompt=cfg["system_prompt"],
@@ -110,8 +125,9 @@ def install(
             # AcpProvider as ``unbound_effort``. This factory accepted
             # ``reasoning_effort_override`` and then dropped it on the floor, so
             # every session ran at the model default while the UI showed the
-            # picked level.
-            reasoning_effort=reasoning_effort_override,
+            # picked level. Falls back to the configured level (OPENAI_* env,
+            # filled from provider.json / crew config) when the caller sends none.
+            reasoning_effort=reasoning_effort_override or cfg.get("reasoning_effort") or None,
             # Names the capability set the effort picker renders from.
             acp_backend=str(_kwargs.get("acp_backend") or ""),
             compaction_threshold=cfg.get("compaction_threshold", 80),
@@ -196,7 +212,9 @@ def install(
     # OpenAI-compatible ``/v1/models`` endpoint first.  The kiro-cli
     # handler is kept as a graceful fallback if upstream is unreachable.
     try:
-        _patch_api_models_fallback(cfg["base_url"], cfg["api_key"])
+        _patch_api_models_fallback(
+            cfg["base_url"], cfg["api_key"], cfg.get("fallback_base_url", ""),
+        )
     except Exception as exc:
         logger.warning("openai_provider: /api/models fallback patch skipped: %s", exc)
 
@@ -207,63 +225,198 @@ def install(
     )
 
 
+def _bridge_dir() -> str:
+    """The bridge's install root (``%LOCALAPPDATA%\\kirocrew-openai-bridge``)."""
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _snapshot_path() -> str:
+    return os.path.join(_bridge_dir(), _SNAPSHOT_NAME)
+
+
+def _read_snapshot() -> list[str]:
+    """Bare ids from the last good catalog fetch, or ``[]``."""
+    try:
+        with open(_snapshot_path(), encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    ids = payload.get("ids") if isinstance(payload, dict) else payload
+    if not isinstance(ids, list):
+        return []
+    return [str(i).strip() for i in ids if isinstance(i, str) and str(i).strip()]
+
+
+def _write_snapshot(ids: list[str]) -> None:
+    """Best-effort persist of a successful answer; never raises into a handler."""
+    path = _snapshot_path()
+    try:
+        with open(path + ".tmp", "w", encoding="utf-8") as fh:
+            json.dump({"fetched_at": time.time(), "ids": ids}, fh)
+        os.replace(path + ".tmp", path)
+    except OSError:
+        logger.debug("openai_provider: could not persist model snapshot", exc_info=True)
+
+
+def _local_catalog_ids() -> list[str]:
+    """Last-resort ids from the local opencode catalog.
+
+    ``~/.config/opencode/opencode.json`` carries ``provider.hub-neo.models`` —
+    the same nine ids, on disk, with no network in the path. Used only when
+    there is no snapshot yet (first run after install).
+    """
+    path = os.path.join(os.path.expanduser("~"), ".config", "opencode", "opencode.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+        models = ((payload.get("provider") or {}).get("hub-neo") or {}).get("models") or {}
+        return [str(k) for k in models if str(k)]
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+def _format_models(
+    ids: list[str], windows: dict[str, int] | None = None,
+) -> list[dict[str, object]]:
+    """KiroCrew's ``/api/models`` row shape for BARE upstream model ids.
+
+    ``windows`` carries whatever window the gateway itself advertised per id:
+    ``model_registry.model_window`` knows nothing about these provider ids and
+    answered 0 for all nine, which made the dashboard's context meter read 0 %
+    on every model. The registry still wins when it knows the id (it is the
+    project's single source of truth); the advertised number is the fallback.
+    """
+    from kiro_crew import model_registry
+
+    windows = windows or {}
+    rows: list[dict[str, object]] = []
+    for mid in ids:
+        rows.append(
+            {
+                "model_name": mid,
+                "description": "",
+                "context_window_tokens": model_registry.model_window(mid)
+                or int(windows.get(mid) or 0),
+                "rate_multiplier": 1.0,
+            }
+        )
+    return rows
+
+
+def _row_window(row: dict) -> int:
+    """Context window advertised by one ``/v1/models`` row, 0 when absent."""
+    caps = row.get("capabilities") if isinstance(row.get("capabilities"), dict) else {}
+    for value in (
+        row.get("context_window"),
+        row.get("context_length"),
+        caps.get("contextWindow"),
+        caps.get("context_window"),
+    ):
+        try:
+            if value and int(value) > 0:
+                return int(value)
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def _degraded_models() -> list[dict[str, object]] | None:
+    """What to serve when the upstream catalog cannot be read.
+
+    Snapshot first (the real cloud list as last seen), local opencode catalog
+    second, ``None`` last — which lets the caller fall back to the stock
+    kiro-cli handler. The order matters: a stale-but-real list beats an empty
+    one, and both beat KiroCrew's built-in list, which names models this
+    deployment cannot run at all.
+    """
+    ids = _read_snapshot()
+    if ids:
+        logger.warning(
+            "openai_provider: upstream /models unreachable — serving %d cached ids"
+            " from %s", len(ids), _snapshot_path(),
+        )
+        return _format_models(ids)
+    ids = _local_catalog_ids()
+    if ids:
+        logger.warning(
+            "openai_provider: upstream /models unreachable and no snapshot — serving"
+            " %d ids from the local opencode catalog", len(ids),
+        )
+        return _format_models(ids)
+    logger.warning("openai_provider: no upstream, no snapshot, no local catalog")
+    return None
+
+
 async def _fetch_upstream_models(
-    base_url: str, api_key: str,
+    base_url: str, api_key: str, fallback_base_url: str = "",
 ) -> list[dict[str, object]] | None:
     """Fetch and format models from the upstream OpenAI-compatible ``/v1/models``.
 
     Returns a list of model dicts formatted for the KiroCrew frontend
-    (``{model_name, description, context_window_tokens, rate_multiplier}``),
-    or ``None`` if the upstream is unreachable, returned an error, or served
-    zero models.
+    (``{model_name, description, context_window_tokens, rate_multiplier}``).
+
+    When the upstream cannot be read, falls back to the last good snapshot and
+    then to the local opencode catalog (see :func:`_degraded_models`) instead of
+    handing the user KiroCrew's built-in list. ``None`` is returned only when
+    nothing local knows the catalog either.
 
     Uses ``model_registry.model_window()`` for context window resolution,
     falling back to ``0`` for unknown models.
     """
     import httpx
 
-    try:
-        async with httpx.AsyncClient(timeout=_UPSTREAM_MODELS_TIMEOUT) as client:
-            resp = await client.get(
-                f"{base_url}/models",
-                headers={"Authorization": f"Bearer {api_key}"},
-            )
-            if resp.status_code != 200:
-                logger.warning(
-                    "openai_provider: upstream /models returned %d", resp.status_code,
+    endpoints = [base_url.rstrip("/")]
+    if fallback_base_url and fallback_base_url.rstrip("/") not in endpoints:
+        endpoints.append(fallback_base_url.rstrip("/"))
+
+    for endpoint in endpoints:
+        try:
+            async with httpx.AsyncClient(timeout=_UPSTREAM_MODELS_TIMEOUT) as client:
+                resp = await client.get(
+                    f"{endpoint}/models",
+                    headers={"Authorization": f"Bearer {api_key}"},
                 )
-                return None
+                if resp.status_code != 200:
+                    logger.warning(
+                        "openai_provider: upstream /models returned %d from %s",
+                        resp.status_code, endpoint,
+                    )
+                    continue
 
-            raw_models = resp.json().get("data", [])
-    except Exception:
-        logger.warning("openai_provider: upstream /models query failed", exc_info=True)
-        return None
+                raw_models = resp.json().get("data", [])
+        except Exception:
+            logger.warning(
+                "openai_provider: upstream /models query failed for %s", endpoint,
+                exc_info=True,
+            )
+            continue
 
-    from kiro_crew import model_registry
-
-    formatted = [
-        {
-            "model_name": raw["id"],
-            "description": "",
-            "context_window_tokens": model_registry.model_window(raw["id"]) or 0,
-            "rate_multiplier": 1.0,
+        ids = [
+            str(raw["id"]).strip()
+            for raw in raw_models
+            if isinstance(raw, dict) and raw.get("id")
+        ]
+        windows = {
+            str(raw["id"]).strip(): _row_window(raw)
+            for raw in raw_models
+            if isinstance(raw, dict) and raw.get("id")
         }
-        for raw in raw_models
-        if raw.get("id")
-    ]
 
-    if not formatted:
-        logger.warning("openai_provider: upstream /models returned 0 models")
-        return None
+        if not ids:
+            logger.warning("openai_provider: /models returned 0 models from %s", endpoint)
+            continue
 
-    logger.info(
-        "openai_provider: upstream /models returned %d models from %s",
-        len(formatted), base_url,
-    )
-    return formatted
+        _write_snapshot(ids)
+        logger.info(
+            "openai_provider: upstream /models returned %d models from %s",
+            len(ids), endpoint,
+        )
+        return _format_models(ids, windows)
+
+    return _degraded_models()
 
 
-def _patch_api_models_fallback(base_url: str, api_key: str) -> None:
+def _patch_api_models_fallback(base_url: str, api_key: str, fallback_base_url: str = "") -> None:
     """Replace ``/api/models`` with an upstream-first model catalog.
 
     Queries the upstream OpenAI-compatible ``/v1/models`` endpoint.  If
@@ -283,7 +436,7 @@ def _patch_api_models_fallback(base_url: str, api_key: str) -> None:
         from aiohttp import web
 
         # Try upstream first — it's the authoritative source.
-        models = await _fetch_upstream_models(base_url, api_key)
+        models = await _fetch_upstream_models(base_url, api_key, fallback_base_url)
         if models is not None:
             return web.json_response(models)
 

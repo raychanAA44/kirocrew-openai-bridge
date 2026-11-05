@@ -105,8 +105,153 @@ def _main() -> None:
     _log(f"installed base_url={cfg['base_url']} model={cfg['model']}")
 
     _patch_live_model_switch()
+    _patch_live_effort()
+    _patch_effort_reapply()
     _patch_factory_model()
     _patch_bg_session()
+    _prewarm_upstream(cfg)
+
+
+def _patch_live_effort() -> None:
+    """Let the effort control change the level WITHOUT a session rebuild.
+
+    ``slot_effort`` only pushes a level live for ``isinstance(provider,
+    AcpProvider)``; for anything else it falls through to the reset path, which
+    tears the session down and rebuilds it from ``agent``'s configured default.
+    On this bridge that rebuild lands on ``provider.json``'s model -- so changing
+    the reasoning level silently moved a chat off the model the user picked and
+    onto the (paid) default. Widening the module's ``AcpProvider`` name to a
+    tuple makes every ``isinstance`` check in that module accept this provider
+    too; the provider answers ``supports_effort`` / ``accepts_effort_level`` /
+    ``change_effort`` itself, so the live branch then runs unchanged.
+    """
+    try:
+        from kiro_crew.dashboard.chat_api import slot_effort as _slot_effort
+        from kiro_crew.providers.acp import AcpProvider as _AcpProvider
+
+        from openai_provider.provider import OpenAIProvider as _OpenAIProvider
+    except Exception as exc:  # noqa: BLE001
+        _log(f"live effort patch skipped: {type(exc).__name__}: {exc}")
+        return
+
+    # This build RELAYS the slot handlers: the function objects are defined in
+    # ``chat_api.slot_effort``/``slot_model`` but their ``__globals__`` is
+    # ``dashboard.chat_handlers``, and the TYPE_CHECKING-only name ``AcpProvider``
+    # resolves there at call time. Widening the wrong module is a silent no-op, so
+    # every module that holds either the name or the handler is patched.
+    widened = (_AcpProvider, _OpenAIProvider)
+    patched: list[str] = []
+    for module_name, module in _relay_modules("slot_effort", _slot_effort):
+        current = getattr(module, "AcpProvider", None)
+        if isinstance(current, type):
+            module.AcpProvider = widened  # type: ignore[attr-defined]
+            patched.append(module_name)
+    if patched:
+        _log(f"live effort patch installed: {', '.join(patched)}")
+    else:
+        _log("live effort patch skipped: no module holds a bare AcpProvider")
+
+
+def _relay_modules(package: str, first) -> list[tuple[str, object]]:
+    """``[(name, module)]`` for every module that may hold a relayed handler."""
+    import importlib
+
+    out: list[tuple[str, object]] = [(package, first)]
+    for name in ("chat_handlers",):
+        try:
+            out.append((name, importlib.import_module(f"kiro_crew.dashboard.{name}")))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+def _patch_effort_reapply() -> None:
+    """Re-apply the slot's level after an in-place model switch, without a reset.
+
+    ``slot_model._reapply_effort_after_live_switch`` calls
+    ``AcpProvider.reapply_live_effort``, which this provider does not implement;
+    it returns False on failure, and False tells the caller to RESET the session
+    -- which rebuilds on the configured default model. That is how a model pick
+    made just before the first message ended up running the default model on the
+    message right after. Answering it through ``change_effort`` keeps the pick.
+    """
+    try:
+        from kiro_crew.dashboard.chat_api import slot_model as _slot_model
+    except Exception as exc:  # noqa: BLE001
+        _log(f"effort-reapply patch skipped: {type(exc).__name__}: {exc}")
+        return
+
+    targets = _relay_modules("slot_model", _slot_model)
+    original = None
+    for _name, module in targets:
+        candidate = getattr(module, "_reapply_effort_after_live_switch", None)
+        if candidate is not None:
+            original = candidate
+            break
+    if original is None:
+        _log("effort-reapply patch skipped: seam not found")
+        return
+
+    async def _patched(name, slot, provider):
+        change = getattr(provider, "change_effort", None)
+        if change is None:
+            return await original(name, slot, provider)
+        try:
+            return bool(await change(slot.reasoning_effort))
+        except Exception as exc:  # noqa: BLE001
+            _log(f"effort reapply failed: {type(exc).__name__}: {exc}")
+            return False
+
+    patched: list[str] = []
+    for module_name, module in targets:
+        if getattr(module, "_reapply_effort_after_live_switch", None) is not None:
+            module._reapply_effort_after_live_switch = _patched  # type: ignore[attr-defined]
+            patched.append(module_name)
+    _log(f"effort-reapply patch installed: {', '.join(patched)}")
+
+
+def _prewarm_upstream(cfg: dict) -> None:
+    """Warm DNS + TCP + TLS for every endpoint, off the event loop.
+
+    Measured on this host: a cold public endpoint costs 102 ms of DNS, 195 ms of
+    TCP and 208 ms of TLS before the first byte of the FIRST request, and one
+    cold-DNS lookup was observed at 18 s. Paying that at startup (in a thread,
+    where nobody waits on it) keeps it out of the user's first turn, and the
+    OS-level DNS answer it caches is what the httpx client reuses afterwards.
+    """
+    try:
+        import threading
+    except Exception as exc:  # noqa: BLE001
+        _log(f"prewarm skipped: {type(exc).__name__}: {exc}")
+        return
+
+    def _warm() -> None:
+        import urllib.request
+
+        seen: list[str] = []
+        for base in (cfg.get("base_url"), cfg.get("fallback_base_url")):
+            base = str(base or "").rstrip("/")
+            if not base or base in seen:
+                continue
+            seen.append(base)
+            try:
+                req = urllib.request.Request(
+                    f"{base}/models",
+                    headers={
+                        "Authorization": f"Bearer {cfg.get('api_key', '')}",
+                        "Accept": "application/json",
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
+                    resp.read(4096)
+                _log(f"prewarm ok {base}")
+            except Exception as exc:  # noqa: BLE001
+                _log(f"prewarm failed {base}: {type(exc).__name__}: {exc}")
+
+    try:
+        threading.Thread(target=_warm, name="hub-neo-prewarm", daemon=True).start()
+    except Exception as exc:  # noqa: BLE001
+        _log(f"prewarm skipped: {type(exc).__name__}: {exc}")
 
 
 def _patch_bg_session() -> None:
@@ -210,6 +355,25 @@ def _last_pick() -> str:
         return ""
 
 
+def _last_pick_age_secs() -> float:
+    try:
+        with open(_last_pick_path(), encoding="utf-8") as fh:
+            return max(0.0, time.time() - float(json.load(fh).get("at") or 0.0))
+    except Exception:  # noqa: BLE001
+        return float("inf")
+
+
+#: How long a composer pick keeps standing in when a rebuild hands the factory a
+#: sentinel. KiroCrew commits a pick on an idle slot right before the first
+#: message spawns the provider, and that spawn carries ``model_override=""`` --
+#: the pick is applied only after the provider exists, so the first turn used to
+#: run the configured DEFAULT model (a different, possibly paid, model) while the
+#: composer showed the pick. Bounded: outside this window a sentinel keeps meaning
+#: "follow the configured default", so a chat started much later is not silently
+#: pinned to whatever was picked last.
+_PICK_GRACE_SECS = 900.0
+
+
 def _session_model(session_key: str | None) -> str:
     """Read the model KiroCrew recorded for a session, if any.
 
@@ -293,12 +457,22 @@ def _patch_factory_model() -> None:
                             fkw["model_override"] = recorded
                             _log(f"factory session={session_key} sentinel -> session model {recorded}")
                         else:
-                            # No session identity and no record: let KiroCrew's own
-                            # configured default win. Remembering the last UI pick here
-                            # made every new chat answer with whichever model was picked
-                            # last, even though the UI showed the default.
-                            fkw.pop("model_override", None)
-                            _log(f"factory session={session_key} sentinel -> configured default")
+                            # No session identity and no record: a pick made
+                            # moments ago in the composer still stands (see
+                            # _PICK_GRACE_SECS); otherwise let KiroCrew's own
+                            # configured default win. Remembering the last UI pick
+                            # forever made every new chat answer with whichever
+                            # model was picked last, even though the UI showed the
+                            # default.
+                            recent = _last_pick()
+                            if recent and _last_pick_age_secs() <= _PICK_GRACE_SECS:
+                                fkw["model_override"] = recent
+                                _log(
+                                    f"factory session={session_key} sentinel -> recent pick {recent}"
+                                )
+                            else:
+                                fkw.pop("model_override", None)
+                                _log(f"factory session={session_key} sentinel -> configured default")
                     else:
                         _log(f"factory session={session_key} model_override={override}")
                 except Exception as exc:  # noqa: BLE001
@@ -378,6 +552,11 @@ def _patch_live_model_switch() -> None:
         return True
 
     _slot_model._try_live_model_switch = _bridge_live_switch  # type: ignore[assignment]
+    # Same relay hazard as the effort handler: the caller may resolve this name
+    # from ``dashboard.chat_handlers``' namespace instead of ``slot_model``.
+    for _name, _module in _relay_modules("slot_model", _slot_model):
+        if getattr(_module, "_try_live_model_switch", None) is not None:
+            _module._try_live_model_switch = _bridge_live_switch  # type: ignore[attr-defined]
     _log("model-switch patch installed")
 
 
