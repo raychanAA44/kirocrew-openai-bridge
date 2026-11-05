@@ -31,19 +31,43 @@ def _log(msg: str) -> None:
         pass
 
 
-def _sanitise_no_proxy() -> None:
-    """Drop bare IPv6 literals from ``no_proxy``.
+def _sanitise_no_proxy(extra_hosts: tuple[str, ...] = ()) -> None:
+    """Clean ``no_proxy`` and add the gateway hosts to it.
 
-    httpx parses every ``no_proxy`` entry as ``host:port`` and raises
-    ``InvalidURL: Invalid port: ':1]'`` on an entry like ``[::1]``, which breaks
-    every HTTP call in the process. Some Windows setups ship exactly that.
+    Two jobs:
+
+    * drop bare IPv6 literals — httpx parses every ``no_proxy`` entry as
+      ``host:port`` and raises ``InvalidURL: Invalid port: ':1]'`` on an entry
+      like ``[::1]``, which breaks every HTTP call in the process. Some Windows
+      setups ship exactly that;
+    * list the gateway's own hostnames, so reaching it never depends on the
+      operator's proxy (Clash/mihomo on ``127.0.0.1:7897`` here). The gateway is
+      public HTTPS and answers direct — DNS 73 ms, TCP 187 ms, TLS 217 ms,
+      ``GET /v1/models`` 633 ms measured with the proxy out of the path — so a
+      proxy outage must not take the model list or the chat down with it. Both
+      ``httpx`` and ``urllib`` honour ``NO_PROXY``, which is why this is set once
+      here instead of threaded through every client.
     """
+    hosts = ["localhost", "127.0.0.1", "::1", *extra_hosts]
     for name in ("no_proxy", "NO_PROXY"):
         parts = [
             p for p in os.environ.get(name, "").split(",")
             if p.strip() and not p.strip().startswith("[")
         ]
-        os.environ[name] = ",".join(dict.fromkeys(parts or ["localhost", "127.0.0.1"]))
+        os.environ[name] = ",".join(dict.fromkeys([*parts, *hosts]))
+
+
+def _endpoint_hosts(cfg: dict) -> tuple[str, ...]:
+    """Hostnames of the configured endpoints, for the no-proxy list."""
+    out: list[str] = []
+    for key in ("base_url", "fallback_base_url"):
+        value = str(cfg.get(key) or "")
+        if "://" not in value:
+            continue
+        host = value.split("://", 1)[1].split("/", 1)[0].split(":", 1)[0].strip()
+        if host and host not in out:
+            out.append(host)
+    return tuple(out)
 
 
 def _main() -> None:
@@ -71,6 +95,9 @@ def _main() -> None:
     install_mod = importlib.import_module("openai_provider.install")
 
     cfg = provider_config.resolve()
+    # The endpoints must never be reached through the operator's proxy: a proxy
+    # outage would otherwise empty the model list and fail every turn.
+    _sanitise_no_proxy(_endpoint_hosts(cfg))
     os.environ.update(provider_config.as_env(cfg))
     _log(
         "target base_url=%s model=%s key=%s (from %s)"

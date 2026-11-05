@@ -52,6 +52,13 @@ _UPSTREAM_MODELS_TIMEOUT = 5.0
 #: "cloud models only appear while OPS is running" symptom.
 _SNAPSHOT_NAME = "models_snapshot.json"
 
+#: Memo for the ``/api/models`` handler. Every dashboard refresh calls it, and
+#: one uncached call is a full HTTP round trip through the proxy stack (~800 ms
+#: measured warm, 4.9 s on the first call after a restart). The list changes when
+#: an operator changes it, so a minute of staleness is free.
+_MODELS_MEMO: tuple[float, list] = (0.0, [])
+_MODELS_MEMO_TTL = 60.0
+
 
 def install(
     *,
@@ -432,12 +439,18 @@ def _patch_api_models_fallback(base_url: str, api_key: str, fallback_base_url: s
     _original_handler = _agents_mod.api_models
 
     async def _api_models_with_upstream(request):  # type: ignore[no-untyped-def]
-        """Upstream-first /api/models with kiro-cli fallback."""
+        """Upstream-first /api/models, memoized, with kiro-cli fallback."""
         from aiohttp import web
+
+        global _MODELS_MEMO
+        stamped, cached = _MODELS_MEMO
+        if cached and time.time() - stamped < _MODELS_MEMO_TTL:
+            return web.json_response(cached)
 
         # Try upstream first — it's the authoritative source.
         models = await _fetch_upstream_models(base_url, api_key, fallback_base_url)
         if models is not None:
+            _MODELS_MEMO = (time.time(), models)
             return web.json_response(models)
 
         # Upstream unavailable — fall back to stock kiro-cli handler.
@@ -455,6 +468,15 @@ def _patch_api_models_fallback(base_url: str, api_key: str, fallback_base_url: s
     # Patch both the module-level and package-level bindings — ``server.py``
     # routes via ``handlers.api_models`` (the package __init__ re-export),
     # not ``handlers.agents.api_models``.
+    # Seed the memo from the snapshot: the first dashboard refresh after a start
+    # used to pay the whole cold path (measured 4.9 s while the gateway was still
+    # restoring memory), and the answer it finally produced was a list the disk
+    # already knew. The snapshot is that same list.
+    global _MODELS_MEMO
+    _seed = _read_snapshot()
+    if _seed:
+        _MODELS_MEMO = (time.time(), _format_models(_seed))
+
     _agents_mod.api_models = _api_models_with_upstream  # type: ignore[assignment]
     import kiro_crew.dashboard.handlers as _handlers_pkg
     _handlers_pkg.api_models = _api_models_with_upstream  # type: ignore[assignment]
