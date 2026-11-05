@@ -127,6 +127,16 @@ _MANAGED_SERVER_MODULES = {
     "kirocrew-core": "kiro_crew.mcp_core",
     "kirocrew-cron": "kiro_crew.mcp_cron",
     "kirocrew-computer": "kiro_crew.mcp_computer",
+    # The rest of crew's own map (mcp_discovery_managed._MANAGED_SERVER_TOOL_MODULES).
+    # Leaving them out made their tools invisible to discovery, so session_create
+    # (kirocrew-dashboard) and work_ledger_* (kirocrew-work) had no owner at all.
+    "kirocrew-dashboard": "kiro_crew.mcp_dashboard",
+    "kirocrew-work": "kiro_crew.mcp_work",
+    "kirocrew-crew-log": "kiro_crew.mcp_crew_log",
+    "kirocrew-debug": "kiro_crew.mcp_debug",
+    "kirocrew-panel": "kiro_crew.mcp_panel",
+    "kirocrew-guide": "kiro_crew.mcp_guide",
+    "kirocrew-mate": "kiro_crew.mcp_mate",
 }
 
 

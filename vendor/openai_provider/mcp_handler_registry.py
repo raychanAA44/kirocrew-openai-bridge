@@ -989,6 +989,69 @@ class SpawnStatusHandler(McpHandler):
         return local or f"Error: {d['error']}"
 
 
+# ── session_create ───────────────────────────────────────────────────────────
+
+class SessionCreateHandler(McpHandler):
+    """Open a new KiroCrew chat session.
+
+    ``session_create`` belongs to the ``kirocrew-dashboard`` MCP server, which
+    this install does not configure -- so crew never advertises the tool and no
+    MCP path can reach it. The dashboard's own create route is
+    ``POST /api/chat/slots``, i.e. exactly what the New-session button calls, so
+    this handler goes there: same store, same defaults, same result row.
+    """
+
+    @property
+    def name(self) -> str: return "session_create"
+
+    def definition(self) -> dict:
+        return {
+            "type": "function",
+            "function": {
+                "name": "session_create",
+                "description": (
+                    "Create a new KiroCrew chat session (a session, not a "
+                    "sub-agent: it keeps its own history and can be reopened). "
+                    "Returns its key, which session tools accept."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string", "description": "What the session is for"},
+                        "agent": {"type": "string", "description": "Agent name/template to open it with"},
+                        "model": {"type": "string", "description": "Model override for the session"},
+                        "memory_mode": {
+                            "type": "string",
+                            "description": "persistent (default) or another mode crew accepts",
+                        },
+                        "folder_id": {"type": "string", "description": "Session folder id to file it into"},
+                    },
+                    "required": ["title"],
+                },
+            },
+        }
+
+    async def execute(self, args: dict) -> str:
+        body: dict[str, Any] = {}
+        for field in ("title", "agent", "agent_kind", "model", "memory_mode", "folder_id"):
+            value = args.get(field)
+            if isinstance(value, str) and value.strip():
+                body[field] = value.strip()[:200]
+        if not body.get("title"):
+            return "Error: title is required (say what the session is for)"
+        d = await _gateway_post("/api/chat/slots", body)
+        if d.get("error"):
+            return f"Error: {d['error']}"
+        key = str(d.get("key") or d.get("name") or d.get("session_key") or "")
+        if not key:
+            return "Error: the gateway created nothing and returned no session key"
+        facts = [f"Created session {key}"]
+        for field in ("title", "agent", "model"):
+            if d.get(field):
+                facts.append(f"{field}={d[field]}")
+        return "\n".join(facts)
+
+
 # ── Auto-register all handlers ───────────────────────────────────────────────
 
 def register_all_builtins() -> None:
@@ -1014,5 +1077,6 @@ def register_all_builtins() -> None:
         SpawnListHandler(),
         SpawnSubAgentsHandler(),
         SpawnStatusHandler(),
+        SessionCreateHandler(),
     )
     logger.info("McpHandlerRegistry: registered %d handlers", len(McpHandlerRegistry._handlers))
