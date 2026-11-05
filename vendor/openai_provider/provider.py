@@ -996,6 +996,22 @@ class OpenAIProvider(LLMProvider):
             return _StreamedResponse(resp)
         return _StreamedResponse(last) if last is not None else last
 
+    def _routable_names(self) -> set[str]:
+        """Tool names the executor can actually run, or an empty set if unknown.
+
+        Empty means "no opinion" (the executor has not discovered anything yet),
+        and the caller then advertises everything -- a stale empty answer must
+        never strip the tool list down to nothing.
+        """
+        executor = getattr(self, "_tool_executor", None)
+        getter = getattr(executor, "routable_names", None)
+        if getter is None:
+            return set()
+        try:
+            return set(getter() or ())
+        except Exception:  # noqa: BLE001
+            return set()
+
     def _wire_tools(self, tools: list[dict]) -> list[dict]:
         """The tool list to send: core + already-loaded, else the whole set.
 
@@ -1005,6 +1021,25 @@ class OpenAIProvider(LLMProvider):
         """
         if not self._tool_defer or not tools:
             return tools
+        # Advertise only what can be executed. KiroCrew offers its whole set
+        # every turn, and a name with no handler and no owning server (kb_read
+        # before obsidian-kb answered, save_notes before kirocrew-mate did) can
+        # only ever come back as an error -- so the model spends a tool call to
+        # learn what this filter already knows. Filtering never empties the set.
+        routable = self._routable_names()
+        if routable:
+            kept = [t for t in tools if _tool_name(t) in routable]
+            if kept and len(kept) < len(tools):
+                _trace(
+                    "tools_routable",
+                    kept=len(kept),
+                    of=len(tools),
+                    dropped=",".join(
+                        sorted(_tool_name(t) for t in tools
+                               if _tool_name(t) not in routable)
+                    )[:400],
+                )
+                tools = kept
         core = [t for t in tools if _tool_name(t) in _CORE_TOOL_NAMES]
         loaded = [
             t for t in tools

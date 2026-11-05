@@ -544,6 +544,19 @@ class McpToolExecutor(ToolExecutor):
             return ""  # local handler, no MCP server
         return _tool_server_map.get(tool_name, "")
 
+    def routable_names(self) -> set[str]:
+        """Every tool name this build can actually execute.
+
+        A tool is routable when a local handler owns it or a discovered server
+        advertises it. Anything else can only be answered with an error, and
+        KiroCrew advertises its whole set every turn (``_CORE_TOOL_NAMES``
+        included), so the wire filter uses this rather than trusting the names.
+        """
+        from .mcp_handler_registry import McpHandlerRegistry
+        names = set(McpHandlerRegistry._handlers)
+        names.update(_tool_server_map)
+        return names
+
     async def execute(self, name: str, args: dict) -> Any:
         """Execute a tool by name with given args, return string result."""
         if self._definitions_cache is None:
