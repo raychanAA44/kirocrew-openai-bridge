@@ -1013,13 +1013,15 @@ class OpenAIProvider(LLMProvider):
             return set()
 
     def _wire_tools(self, tools: list[dict]) -> list[dict]:
-        """The tool list to send: core + already-loaded, else the whole set.
+        """The tool list to send: only executable names, then core + loaded.
 
         Deferral only pays when there is something to defer, so a set that is
         already small (or a provider with deferral switched off) passes through
-        untouched -- including when the model answered a 400 earlier.
+        untouched -- including when the model answered a 400 earlier. The
+        routability filter is NOT part of deferral: a name this build cannot run
+        is a wasted tool call either way, so it is applied before that switch.
         """
-        if not self._tool_defer or not tools:
+        if not tools:
             return tools
         # Advertise only what can be executed. KiroCrew offers its whole set
         # every turn, and a name with no handler and no owning server (kb_read
@@ -1030,16 +1032,19 @@ class OpenAIProvider(LLMProvider):
         if routable:
             kept = [t for t in tools if _tool_name(t) in routable]
             if kept and len(kept) < len(tools):
+                dropped = sorted(_tool_name(t) for t in tools
+                                 if _tool_name(t) not in routable)
                 _trace(
                     "tools_routable",
                     kept=len(kept),
                     of=len(tools),
-                    dropped=",".join(
-                        sorted(_tool_name(t) for t in tools
-                               if _tool_name(t) not in routable)
-                    )[:400],
+                    dropped=",".join(dropped)[:400],
+                    dropped_core=",".join(n for n in dropped
+                                          if n in _CORE_TOOL_NAMES)[:200],
                 )
                 tools = kept
+        if not self._tool_defer:
+            return tools
         core = [t for t in tools if _tool_name(t) in _CORE_TOOL_NAMES]
         loaded = [
             t for t in tools

@@ -194,6 +194,10 @@ async def _discover_external_tools() -> tuple[list[dict], dict[str, list[str]]]:
                 by_server[server.name] = [t["name"] for t in server_tools]
         except Exception as exc:
             logger.debug("Failed to discover tools from %s: %s", server.name, exc)
+            # A probe that fails silently costs its tools on the wire: the
+            # filter treats "no owner" as "cannot run", so kb_* disappearing
+            # from a session has to leave a trace rather than a debug line.
+            _trace_mcp_fail(server.name, "-", "discovery failed", str(exc))
 
     return tools, by_server
 
@@ -551,8 +555,14 @@ class McpToolExecutor(ToolExecutor):
         advertises it. Anything else can only be answered with an error, and
         KiroCrew advertises its whole set every turn (``_CORE_TOOL_NAMES``
         included), so the wire filter uses this rather than trusting the names.
+
+        Empty means NO OPINION: before discovery has run, the server map is not
+        filled in yet, and filtering on it would cut every crew tool down to the
+        thirteen local handlers on the first turn of a session.
         """
         from .mcp_handler_registry import McpHandlerRegistry
+        if self._definitions_cache is None:
+            return set()
         names = set(McpHandlerRegistry._handlers)
         names.update(_tool_server_map)
         return names
