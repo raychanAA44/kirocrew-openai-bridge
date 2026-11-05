@@ -724,7 +724,10 @@ class SpawnSubAgentsHandler(McpHandler):
     """
 
     #: How long to wait for the children before answering with what is known.
-    _WAIT_SECS = 120.0
+    #: A wave that runs longer is not lost: its completion events still arrive,
+    #: and spawn_list/spawn_status answer for it. Waiting the full length of a
+    #: long wave inside one tool call only makes the turn feel dead.
+    _WAIT_SECS = 30.0
     _POLL_SECS = 2.0
     #: Statuses that mean the run will not change again.
     _TERMINAL = frozenset({"done", "completed", "failed", "error", "cancelled",
@@ -872,6 +875,120 @@ class SpawnSubAgentsHandler(McpHandler):
         return "\n".join(lines)
 
 
+# ── spawn_status ─────────────────────────────────────────────────────────────
+
+def _subagent_dir(agent_id: str) -> Path | None:
+    """Where a run's state lives on disk, or None if the id is not a plain id."""
+    if not agent_id or not all(c.isalnum() or c in "-_" for c in agent_id):
+        return None
+    base = Path(os.path.expanduser("~")) / ".kiro" / "crew" / "subagents" / agent_id
+    return base if base.is_dir() else None
+
+
+def _local_run_report(agent_id: str) -> str:
+    """Answer from the run's own folder when the gateway will not.
+
+    A run whose ``parent_session`` was recorded empty is invisible to the
+    session-scoped route -- the folder exists, the work happened, and the only
+    answer was ``not found``. The folder is enough to say what the run was and
+    how it ended, and it is read-only, so this is a report, not a repair.
+    """
+    base = _subagent_dir(agent_id)
+    if base is None:
+        return ""
+    state: dict = {}
+    try:
+        state = json.loads((base / "state.json").read_text(encoding="utf-8-sig"))
+    except Exception:  # noqa: BLE001
+        return ""
+    tomb: dict = {}
+    try:
+        tomb = json.loads((base / "tombstone.json").read_text(encoding="utf-8-sig"))
+    except Exception:  # noqa: BLE001
+        pass
+    if tomb.get("cause"):
+        status = f"ended ({tomb['cause']})"
+    elif state.get("done"):
+        status = "done"
+    elif state.get("pid"):
+        status = "running"
+    else:
+        status = "unknown"
+    lines = [f"{agent_id} [{status}] agent={state.get('agent', '?')}"]
+    if state.get("task"):
+        lines.append(f"task: {str(state['task'])[:200]}")
+    facts = []
+    if state.get("turns"):
+        facts.append(f"turns={state['turns']}")
+    if tomb.get("elapsed"):
+        facts.append(f"elapsed={round(float(tomb['elapsed']), 1)}s")
+    if state.get("cwd"):
+        facts.append(f"cwd={state['cwd']}")
+    if state.get("parent_session"):
+        facts.append(f"parent={state['parent_session']}")
+    else:
+        facts.append("parent=<unrecorded>")
+    if facts:
+        lines.append(" ".join(facts))
+    result_path = str(tomb.get("result_path") or "")
+    if result_path and Path(result_path).is_file():
+        try:
+            text = Path(result_path).read_text(encoding="utf-8", errors="replace")
+            lines.append("result:\n" + text[:2000])
+        except Exception:  # noqa: BLE001
+            pass
+    elif tomb and not tomb.get("result_available", True):
+        lines.append("result: delivered as a completion event, not stored on disk")
+    lines.append("(answered from the run folder: the gateway has no session-scoped record of this id)")
+    return "\n".join(lines)
+
+
+class SpawnStatusHandler(McpHandler):
+    """spawn_status with a read-only disk fallback.
+
+    KiroCrew's own tool asks the gateway, which answers only for runs bound to
+    the calling session. Runs recorded before the identity fix -- and any run
+    whose ``parent_session`` came out empty -- answered ``not found`` even though
+    the folder and the tombstone were right there. This handler asks the gateway
+    first, then reads the run's own folder.
+    """
+
+    @property
+    def name(self) -> str: return "spawn_status"
+
+    def definition(self) -> dict:
+        return {
+            "type": "function",
+            "function": {
+                "name": "spawn_status",
+                "description": "Status and result of one sub-agent by id.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "agent_id": {"type": "string", "description": "Sub-agent id"},
+                    },
+                    "required": ["agent_id"],
+                },
+            },
+        }
+
+    async def execute(self, args: dict) -> str:
+        agent_id = str(args.get("agent_id") or "").strip()
+        if not agent_id:
+            return "Error: agent_id is required"
+        d = await _gateway_get(f"/api/spawn/{agent_id}")
+        if not d.get("error"):
+            status = str(d.get("status") or ("done" if d.get("done") else "running"))
+            lines = [f"{agent_id} [{status}]"]
+            if d.get("task"):
+                lines.append(f"task: {str(d['task'])[:200]}")
+            if d.get("result"):
+                lines.append("result:\n" + str(d["result"])[:2000])
+            return "\n".join(lines)
+        local = _local_run_report(agent_id)
+        return local or f"Error: {d['error']}"
+
+
 # ── Auto-register all handlers ───────────────────────────────────────────────
 
 def register_all_builtins() -> None:
@@ -896,5 +1013,6 @@ def register_all_builtins() -> None:
         SpawnRunHandler(),
         SpawnListHandler(),
         SpawnSubAgentsHandler(),
+        SpawnStatusHandler(),
     )
     logger.info("McpHandlerRegistry: registered %d handlers", len(McpHandlerRegistry._handlers))

@@ -1505,7 +1505,16 @@ class OpenAIProvider(LLMProvider):
             from kiro_crew.mcp_gateway.claim import mint_stub_session_token
 
             token = mint_stub_session_token()
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            # Silent degradation here is indistinguishable from "no token
+            # needed": the next loopback call then arrives as an unattested
+            # caller and a session-scoped read is refused, with nothing in the
+            # trace to explain it.
+            _trace("identity", session=session_key, token="",
+                   reason=f"{type(exc).__name__}: {exc}"[:200])
+            return ""
+        if not token:
+            _trace("identity", session=session_key, token="", reason="mint returned empty")
             return ""
         self._stub_token = token
         self._stub_token_key = session_key
