@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import os
+import re as _re
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
@@ -117,6 +118,59 @@ def _child_shell_env() -> dict[str, str]:
     return env
 
 
+#: What cmd.exe prints when the FIRST word is not a program it can find. The
+#: English and zh-CN spellings both appear on this host.
+_CMD_NOT_FOUND = (
+    "is not recognized as an internal or external command",
+    "不是内部或外部命令",
+    "系统找不到指定的路径",
+    "The system cannot find the path specified",
+)
+
+
+def _shell_pitfall_hint(cmd: str, out: str = "") -> str:
+    """Name the cmd.exe trap a command walked into, or return ''.
+
+    ``create_subprocess_shell`` on Windows runs ``cmd /c``, and cmd is not the
+    shell the model writes for: single quotes are literal, ``%`` opens a variable
+    expansion, and ``&&``/``&`` are operators that also eat the rest of a line.
+    Each of those fails in a way whose message says nothing about the real
+    cause, which is how a verification step becomes a retry loop.
+    """
+    hints: list[str] = []
+    stripped = cmd.strip()
+    if stripped.count('"') % 2:
+        hints.append(
+            'an odd number of double quotes: cmd /c needs them balanced, and '
+            'inner quotes escaped as \\" inside a quoted argument'
+        )
+    if "'" in cmd and '"' not in cmd and os.name == "nt":
+        hints.append(
+            "single quotes are literal characters in cmd /c, not quoting: use "
+            'double quotes ("...") for anything containing spaces'
+        )
+    # %VAR% is a real expansion; a lone % (printf/strftime/percent) is not, and
+    # cmd leaves it as-is -- flag only the pattern that actually needs %%.
+    for match in _re.finditer(r"%(?!%)([A-Za-z_][A-Za-z0-9_]*)%", cmd):
+        if match.group(1).lower() not in ("path", "cd", "date", "time", "random",
+                                          "temp", "tmp", "username", "userprofile"):
+            hints.append(
+                f"%{match.group(1)}% is expanded by cmd /c: write %%{match.group(1)}%% "
+                "in a batch context, or pass the value as an argument"
+            )
+            break
+    if out:
+        lowered = out.lower()
+        if any(marker.lower() in lowered for marker in _CMD_NOT_FOUND):
+            hints.append(
+                "the shell could not find the program named first: it may be a "
+                "path with spaces that lost its quotes, or not on PATH"
+            )
+    if not hints:
+        return ""
+    return "[shell note] " + "; ".join(hints)
+
+
 class BashHandler(McpHandler):
     @property
     def name(self) -> str: return "execute_bash"
@@ -139,6 +193,12 @@ class BashHandler(McpHandler):
         err = _decode_child(stderr)
         if err: out += f"\n[stderr]\n{err}"
         if proc.returncode: out += f"\n[exit code: {proc.returncode}]"
+        # A failure whose message does not name its cause is the one the model
+        # retries verbatim. Say what cmd actually objected to.
+        if proc.returncode:
+            hint = _shell_pitfall_hint(cmd, out)
+            if hint:
+                out += f"\n{hint}"
         return out
 
 
