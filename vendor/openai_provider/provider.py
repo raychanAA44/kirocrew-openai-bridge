@@ -1035,22 +1035,36 @@ class OpenAIProvider(LLMProvider):
         """
         pool = self._all_tools or []
         by_name = {_tool_name(t): t for t in pool}
+        folded = {name.lower(): name for name in by_name}
         chosen: list[str] = []
-        for name in names:
-            name = str(name or "").strip()
-            if name in by_name and name not in chosen:
+        for raw in names:
+            raw = str(raw or "").strip()
+            # A model writes names as it saw them in prose ("Monitor_Start") or
+            # fully qualified ("mcp__kirocrew-core__monitor_start"); either one
+            # must land, because failing an explicit request is the worst answer.
+            if "__" in raw:
+                raw = raw.rsplit("__", 1)[-1] or raw
+            name = raw if raw in by_name else folded.get(raw.lower(), "")
+            if name and name not in chosen:
                 chosen.append(name)
-        ranked = _score_tools(_words(query), pool) if query else []
-        for _, name in ranked[:8]:
-            if name not in chosen:
-                chosen.append(name)
-        chosen = chosen[:12]
+        if query:
+            # Repeated words would score the same tool twice ("create" twice in
+            # one real query moved an unrelated cron tool into the top eight).
+            terms = list(dict.fromkeys(_words(query)))
+            matched = _score_tools(terms, pool)
+            for _, name in matched[:8]:
+                if name not in chosen:
+                    chosen.append(name)
+        else:
+            matched = []
+        if len(chosen) > 24:
+            chosen = chosen[:24]
         fresh = [name for name in chosen if name not in self._activated_tools]
         self._activated_tools.update(chosen)
         _trace(
             "tools_loaded",
             query=str(query or "")[:160],
-            candidates=len(ranked),
+            candidates=len(matched),
             names=",".join(chosen)[:200],
             fresh=len(fresh),
         )
@@ -1063,7 +1077,8 @@ class OpenAIProvider(LLMProvider):
             return "\n".join([
                 "No tool matched those words, so nothing was loaded.",
                 f"{len(available)} more tools are available. Call tool_search again "
-                f"with names: [\"<exact name>\"], or with different words.",
+                f"with names: [\"<exact name>\"], or with different words -- words "
+                f"are matched against the English tool names and descriptions.",
                 ", ".join(head) + (" ..." if len(available) > len(head) else ""),
             ])
         lines = ["Loaded (callable from now on):"]
