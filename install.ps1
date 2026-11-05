@@ -24,6 +24,9 @@
 param(
     [string]$CrewBackend,
     [string]$BaseUrl,
+    # Second endpoint, read only when the model catalog cannot be fetched from
+    # -BaseUrl (dead primary then costs a list refresh, not an empty picker).
+    [string]$FallbackBaseUrl,
     [string]$ApiKey,
     [string]$Model,
     [int]$MaxTokens = 8192,
@@ -113,6 +116,7 @@ if ($BaseUrl -or $ApiKey -or $Model) {
         max_tokens     = $MaxTokens
         context_window = $ContextWindow
     }
+    if ($FallbackBaseUrl) { $cfg.Insert(1, 'fallback_base_url', $FallbackBaseUrl) }
     if ($DryRun) { Say "   would write $providerJson" }
     else {
         # No BOM: PowerShell 5.1's Set-Content -Encoding UTF8 writes one, and a BOM

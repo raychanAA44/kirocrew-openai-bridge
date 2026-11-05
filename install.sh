@@ -10,6 +10,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/kirocrew-openai-bridge"
 CREW_BACKEND=""
 BASE_URL=""
+FALLBACK_BASE_URL=""
 API_KEY=""
 MODEL=""
 MAX_TOKENS=8192
@@ -22,7 +23,8 @@ usage() {
 usage: ./install.sh [options]
 
   --crew-backend DIR   KiroCrew backend dir (the one containing python + Lib/site-packages)
-  --base-url URL       e.g. http://127.0.0.1:28791/v1
+  --base-url URL       e.g. https://gw.rayyy.me:9443/v1
+  --fallback-base-url URL  only read when the catalog fetch against --base-url fails
   --api-key KEY        bearer token (prefer the OPENAI_API_KEY environment variable)
   --model NAME         e.g. oc/beam-free
   --max-tokens N       default 8192
@@ -37,6 +39,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --crew-backend)   CREW_BACKEND="$2"; shift 2 ;;
     --base-url)       BASE_URL="$2"; shift 2 ;;
+    --fallback-base-url) FALLBACK_BASE_URL="$2"; shift 2 ;;
     --api-key)        API_KEY="$2"; shift 2 ;;
     --model)          MODEL="$2"; shift 2 ;;
     --max-tokens)     MAX_TOKENS="$2"; shift 2 ;;
@@ -108,6 +111,7 @@ if [ -n "$BASE_URL" ] || [ -n "$MODEL" ]; then
     cat > "$INSTALL_DIR/provider.json" <<JSON
 {
   "base_url": "$BASE_URL",
+  "fallback_base_url": "$FALLBACK_BASE_URL",
   "api_key": "$API_KEY",
   "model": "$MODEL",
   "max_tokens": $MAX_TOKENS,

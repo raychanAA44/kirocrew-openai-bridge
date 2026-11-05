@@ -50,15 +50,27 @@ and every other Python process on the machine are untouched.
 ```powershell
 # Windows (needs admin: it writes two files into KiroCrew's site-packages)
 powershell -ExecutionPolicy Bypass -File .\install.ps1 `
-  -BaseUrl http://127.0.0.1:8888/v1 -ApiKey sk-... -Model ollama/llama3.3:70b
+  -BaseUrl https://gw.rayyy.me:9443/v1 -ApiKey $env:KWSA_KEY -Model oc/beam-free `
+  -FallbackBaseUrl http://127.0.0.1:28791/v1
 
 # then restart the KiroCrew desktop app and open a new chat
 ```
 
 ```bash
 # Linux / macOS (untested — see docs/compatibility.md)
-sudo ./install.sh --base-url http://127.0.0.1:8888/v1 --api-key sk-... --model gpt-4o-mini
+sudo ./install.sh --base-url https://gw.rayyy.me:9443/v1 --api-key "$KWSA_KEY" \
+  --model oc/beam-free --fallback-base-url http://127.0.0.1:28791/v1
 ```
+
+`-BaseUrl` is the endpoint chat goes to; `-FallbackBaseUrl` is only read when the
+model catalog cannot be fetched from the primary, so a dead primary costs a
+refresh instead of an empty picker. Both are optional flags — omit them and the
+installer writes no `provider.json`, leaving an existing one alone.
+
+The two values that used to be printed here (`127.0.0.1:8888` and `gpt-4o-mini`)
+were a trap: 8888 is a different gateway that rejects this kind of key with 401,
+and no gateway on this deployment serves `gpt-4o-mini`, so the very first request
+after a clean install failed with "Model is unavailable" and nothing said why.
 
 Dry run, diagnose, uninstall:
 

@@ -151,6 +151,35 @@ _TRACE_PATH = os.path.join(
 )
 
 
+#: Statuses worth one retry against the other endpoint. 503 is the public TLS
+#: facade's non-blocking concurrency refusal, 429 its per-IP rate limit; the rest
+#: are the usual transient upstream answers.
+_RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+
+
+class _StreamedResponse:
+    """``async with`` wrapper for a streamed ``httpx.Response``.
+
+    ``client.stream()`` returns a context manager; ``client.send(stream=True)``
+    returns the response alone, and this httpx build gives it no ``__aenter__``.
+    Wrapping keeps the caller's ``async with ... as resp:`` shape (and therefore
+    its indentation) while still closing the connection on every exit path.
+    """
+
+    def __init__(self, resp: Any) -> None:
+        self._resp = resp
+
+    async def __aenter__(self) -> Any:
+        return self._resp
+
+    async def __aexit__(self, *_exc: object) -> bool:
+        try:
+            await self._resp.aclose()
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+
 def _trace(kind: str, **fields: object) -> None:
     """Append one line per turn: which model was asked for, which one answered.
 
@@ -773,15 +802,64 @@ class OpenAIProvider(LLMProvider):
                 out.append(candidate)
         return out
 
+    async def _open_stream(self, client: Any, payload: dict, headers: dict) -> Any:
+        """Open the chat stream, trying the other endpoint once if it refuses.
+
+        The public TLS facade caps concurrency at 16 and answers ``503 busy``
+        immediately (no queueing), and it rate-limits at 300 req/60 s per IP. On
+        a burst — subagents fanning out — the first attempt can therefore lose a
+        race it would win a second later, while the local tunnel is free. The
+        retry happens BEFORE a single byte is yielded, so it cannot duplicate
+        output; a mid-stream failure is left alone (that one needs a real resume,
+        not a silent replay).
+
+        Every response is returned as a streamed one; the caller closes it.
+        """
+        import httpx
+
+        endpoints = self._endpoints()
+        last: Any = None
+        for attempt, base in enumerate(endpoints[:2]):
+            last_error: Exception | None = None
+            try:
+                request = client.build_request(
+                    "POST",
+                    f"{base}/chat/completions",
+                    json=payload,
+                    headers=headers,
+                )
+                resp = await client.send(request, stream=True)
+            except httpx.TransportError as exc:
+                resp, last_error = None, exc
+            if resp is not None and resp.status_code == 200:
+                return _StreamedResponse(resp)
+            status = resp.status_code if resp is not None else "transport"
+            if attempt + 1 < len(endpoints) and (
+                last_error is not None or status in _RETRYABLE_STATUS
+            ):
+                if resp is not None:
+                    try:
+                        await resp.aclose()
+                    except Exception:  # noqa: BLE001
+                        pass
+                _trace("retry", status=status, from_endpoint=base, reason="endpoint retry")
+                last = resp
+                continue
+            if resp is None:
+                raise last_error  # type: ignore[misc]
+            return _StreamedResponse(resp)
+        return _StreamedResponse(last) if last is not None else last
+
     def _chat_base_url(self) -> str:
         """Which endpoint this turn's chat request goes to.
 
         Two endpoints, opposite trade-offs. The local SSH tunnel reaches the
-        gateway one hop closer: measured TTFB 3 184.9 ms over the public TLS
-        facade against 2 693.3 ms through the tunnel for the same 118 KB payload,
-        because the facade terminates TLS and re-forwards. The public endpoint,
-        though, is the DURABLE one -- it needs no OPS/control.mjs process to be
-        alive, and a cold DNS lookup there can cost seconds.
+        gateway one hop closer, and an alternating A/B (same payload, same free
+        model, n=5 each) measured it ahead by 365 ms of TTFB on a short prompt
+        and 581 ms on a ~20k-token one -- the facade terminates TLS, rewrites
+        Host and re-forwards. The public endpoint, though, is the DURABLE one --
+        it needs no OPS/control.mjs process to be alive, and a cold DNS lookup
+        there can cost seconds.
 
         So the tunnel wins whenever it actually answers, and the public endpoint
         is the fallback the moment it does not. The probe is a loopback TCP
@@ -1381,12 +1459,7 @@ class OpenAIProvider(LLMProvider):
         assistant_text = ""
 
         async with httpx.AsyncClient(timeout=120.0) as client:
-            async with client.stream(
-                "POST",
-                f"{self._chat_base_url()}/chat/completions",
-                json=payload,
-                headers=headers,
-            ) as resp:
+            async with await self._open_stream(client, payload, headers) as resp:
                 if resp.status_code != 200:
                     body = await resp.aread()
                     raise RuntimeError(
