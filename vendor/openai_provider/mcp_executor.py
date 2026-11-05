@@ -96,6 +96,22 @@ def _child_env() -> dict[str, str]:
     return env
 
 
+def _trace_mcp_fail(server: str, tool: str, err: str, stderr: str = "") -> None:
+    """Record a failed MCP execution where the turn log can show it.
+
+    Without this the two failures that matter most -- a server that does not
+    advertise the tool, and a server that died before answering -- looked
+    identical (both ``None``), which is how a cron refusal was mistaken for a
+    spawn result. Imported lazily: provider.py imports this module.
+    """
+    try:
+        from .provider import _trace
+        _trace("mcp_fail", server=server, tool=tool, err=err[:300],
+               stderr=stderr[-300:])
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # ── Managed server tool discovery (in-process, no spawn) ─────────────────────
 
 # These are the managed MCP servers whose _list_tools() we can call directly
@@ -140,21 +156,25 @@ def _discover_managed_tools() -> tuple[list[dict], dict[str, list[str]]]:
 
 # ── Non-managed server discovery (via mcp_discovery) ─────────────────────────
 
-async def _discover_external_tools() -> list[dict]:
+async def _discover_external_tools() -> tuple[list[dict], dict[str, list[str]]]:
     """Discover tools from non-managed MCP servers via mcp_discovery.
 
     Uses mcp_discovery.list_servers() to find configured servers, then spawns
     each one and sends tools/list to get full schemas.
 
-    Returns list of MCP-format tool dicts: {name, description, inputSchema}.
+    Returns ``(tools, tools_by_server)``. The mapping is the point: execution
+    must ask the server that actually ADVERTISES a tool, never "whichever server
+    answers first" -- a server that does not own the tool replies with its own
+    error text, and that text used to be handed to the model as the result.
     """
     try:
         from kiro_crew.mcp_discovery import list_servers
     except ImportError:
-        return []
+        return [], {}
 
     servers = list_servers()
     tools: list[dict] = []
+    by_server: dict[str, list[str]] = {}
 
     for server in servers:
         # Skip managed servers (handled by _discover_managed_tools)
@@ -170,10 +190,12 @@ async def _discover_external_tools() -> list[dict]:
         try:
             server_tools = await _probe_server_tools(server)
             tools.extend(server_tools)
+            if server_tools:
+                by_server[server.name] = [t["name"] for t in server_tools]
         except Exception as exc:
             logger.debug("Failed to discover tools from %s: %s", server.name, exc)
 
-    return tools
+    return tools, by_server
 
 
 async def _probe_server_tools(server) -> list[dict]:
@@ -357,6 +379,7 @@ async def _execute_via_mcp_stdio(
         # Read response
         resp_line = await asyncio.wait_for(proc.stdout.readline(), timeout=30.0)
         if not resp_line:
+            _trace_mcp_fail(server_name, tool_name, "empty stdout")
             return None
 
         resp = json.loads(resp_line)
@@ -370,7 +393,15 @@ async def _execute_via_mcp_stdio(
         return "\n".join(parts) if parts else json.dumps(result)
 
     except Exception as exc:
+        stderr_tail = ""
+        try:
+            if proc is not None and proc.stderr is not None:
+                raw = await asyncio.wait_for(proc.stderr.read(), timeout=1.0)
+                stderr_tail = raw.decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001
+            pass
         logger.debug("MCP stdio execution of %s/%s failed: %s", server_name, tool_name, exc)
+        _trace_mcp_fail(server_name, tool_name, f"{type(exc).__name__}: {exc}", stderr_tail)
         return None
     finally:
         if proc:
@@ -453,13 +484,17 @@ class McpToolExecutor(ToolExecutor):
 
             # Discover tools from non-managed servers (spawn + MCP protocol)
             external_tools: list[dict] = []
+            external_by_server: dict[str, list[str]] = {}
             try:
-                external_tools = await _discover_external_tools()
+                external_tools, external_by_server = await _discover_external_tools()
             except Exception as exc:
                 logger.warning("External MCP discovery failed: %s", exc)
 
-            # Build tool → server mapping for execution
-            _build_tool_server_map(tools_by_server=managed_tools_by_server)
+            # Build tool → server mapping for execution. Both discovery paths
+            # contribute, so every advertised tool has exactly one owner.
+            _build_tool_server_map(
+                tools_by_server={**managed_tools_by_server, **external_by_server}
+            )
 
             # Track MCP tool names (for execution routing)
             all_mcp_tools = managed_tools + external_tools
@@ -542,22 +577,26 @@ async def _call_tool(
             logger.exception("Handler %r failed", name)
             return f"[Tool execution error: {exc}]"
 
-    # 2. Try MCP stdio (for tools discovered from MCP servers)
+    # 2. Try MCP stdio -- ONLY the server that advertises this tool.
     if name in mcp_tool_names:
-        # Find which server hosts this tool
         server_name = _tool_server_map.get(name)
         if server_name:
             result = await _execute_via_mcp_stdio(server_name, name, args)
             if result is not None:
                 return result
 
-        # Fallback: try all known servers
-        for srv_name in _server_info:
-            result = await _execute_via_mcp_stdio(srv_name, name, args)
-            if result is not None:
-                return result
-
-        logger.warning("MCP tool %r found in discovery but execution failed", name)
+        # No sweep of the other servers. Tried that once: a spawn_sub_agents
+        # call reached kirocrew-cron, whose shim forwards any name to
+        # POST /api/crons/tools, and the model got "Provide a known cron tool
+        # and an arguments object." as the result of a spawn it believed had
+        # run. A tool the bridge cannot route is an error, not a lottery.
+        owner = f"its owner {server_name!r} answered nothing" if server_name \
+            else "no server advertises it"
+        _trace_mcp_fail(server_name or "-", name, "not routable")
+        raise RuntimeError(
+            f"MCP tool {name!r} could not be executed: {owner}. "
+            f"Servers: {', '.join(sorted(_server_info)) or 'none'}"
+        )
 
     # 3. No handler found
     available = ", ".join(sorted(McpHandlerRegistry._handlers.keys()))

@@ -442,6 +442,37 @@ async def _gateway_post(path: str, body: dict) -> dict:
     return await asyncio.to_thread(_gateway_post_sync, path, body, secret, session_key, api)
 
 
+def _gateway_get_sync(path: str, secret: str, session_key: str, api: str) -> dict:
+    """Blocking GET from the gateway loopback API. Runs in the thread pool."""
+    import urllib.error
+    import urllib.request
+
+    headers = {"X-Internal-Secret": secret}
+    if session_key:
+        headers["X-Session-Key"] = session_key
+    req = urllib.request.Request(f"{api}{path}", headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        try:
+            return {"error": json.loads(e.read()).get("error", str(e))}
+        except Exception:
+            return {"error": str(e)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def _gateway_get(path: str) -> dict:
+    """GET from the gateway loopback API (non-blocking via thread pool)."""
+    import asyncio
+
+    api = _resolve_gateway_api()
+    return await asyncio.to_thread(
+        _gateway_get_sync, path, _internal_secret(), _resolve_session_key(), api
+    )
+
+
 # ── ask_question ─────────────────────────────────────────────────────────────
 
 class AskQuestionHandler(McpHandler):
@@ -629,6 +660,165 @@ class SpawnListHandler(McpHandler):
         return "\n".join(lines)
 
 
+# ── spawn_sub_agents ─────────────────────────────────────────────────────────
+
+class SpawnSubAgentsHandler(McpHandler):
+    """KiroCrew's own ``spawn_sub_agents``, executed here instead of MCP.
+
+    kirocrew-core advertises this tool, but no MCP process can run it: it is a
+    DEFERRED tool that KiroCrew's chat loop drives itself. Unhandled, the call
+    fell through to the generic MCP path, where the "try every server" fallback
+    handed the same arguments to kirocrew-cron, whose shim forwards anything to
+    POST /api/crons/tools -- so the model was answered with that route's own
+    refusal ("Provide a known cron tool and an arguments object.") as if it were
+    a result. That is what every spawn in a chat turned into.
+
+    So it gets a real local implementation, over the same POST /api/spawn route
+    KiroCrew's own wave uses, and it waits for the children the way the stock
+    tool does -- bounded, so a long wave answers "still running" with ids rather
+    than hanging the turn.
+    """
+
+    #: How long to wait for the children before answering with what is known.
+    _WAIT_SECS = 120.0
+    _POLL_SECS = 2.0
+    #: Statuses that mean the run will not change again.
+    _TERMINAL = frozenset({"done", "completed", "failed", "error", "cancelled",
+                           "canceled", "stopped", "orphaned"})
+
+    @property
+    def name(self) -> str: return "spawn_sub_agents"
+
+    def definition(self) -> dict:
+        return {
+            "type": "function",
+            "function": {
+                "name": "spawn_sub_agents",
+                "description": (
+                    "Spawn one or more sub-agents to run tasks in parallel. Each "
+                    "sub-agent gets its own session with full tool access. Returns "
+                    "their results when they finish (waits up to ~120s, then "
+                    "reports which are still running). Use for delegating "
+                    "independent subtasks to specialist agents."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "agents": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "agent_or_mode": {
+                                        "type": "string",
+                                        "description": "Agent name for the sub-agent. "
+                                                       "An unknown name is refused, not defaulted.",
+                                    },
+                                    "prompt": {
+                                        "type": "string",
+                                        "description": "Task/prompt for the sub-agent",
+                                    },
+                                },
+                                "required": ["prompt"],
+                            },
+                            "description": "Array of sub-agents to spawn in parallel",
+                        },
+                        "cwd": {
+                            "type": "string",
+                            "description": "Optional absolute path to launch sub-agents in.",
+                        },
+                        "max_turns": {"type": "integer", "description": "Tool-call budget override"},
+                        "include_memory": {"type": "boolean"},
+                        "include_lessons": {"type": "boolean"},
+                        "include_project": {"type": "boolean"},
+                    },
+                    "required": ["agents"],
+                },
+            },
+        }
+
+    async def execute(self, args: dict) -> str:
+        import asyncio
+        import time
+
+        entries = args.get("agents")
+        if not isinstance(entries, list) or not entries:
+            return "Error: agents is required (a list of {prompt, agent_or_mode})"
+
+        parent_session = _resolve_session_key()
+        cwd = args.get("cwd") or ""
+        max_turns = args.get("max_turns") or 0
+        inc_memory = args.get("include_memory", True) is not False
+        inc_lessons = args.get("include_lessons", True) is not False
+        inc_project = args.get("include_project", True) is not False
+
+        started: list[tuple[str, str, str]] = []   # (agent_id, agent, prompt)
+        errors: list[str] = []
+        for i, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                errors.append(f"#{i}: each agents[] member must be an object")
+                continue
+            prompt = str(entry.get("prompt") or "").strip()
+            if not prompt:
+                errors.append(f"#{i}: prompt is required")
+                continue
+            agent = str(entry.get("agent_or_mode") or "").strip()
+            body: dict[str, Any] = {
+                "task": prompt, "agent": agent, "parent_session": parent_session,
+            }
+            if cwd:
+                body["cwd"] = cwd
+            if max_turns:
+                body["max_turns"] = max_turns
+            if not inc_memory:
+                body["include_memory"] = False
+            if not inc_lessons:
+                body["include_lessons"] = False
+            if not inc_project:
+                body["include_project"] = False
+            reply = await _gateway_post("/api/spawn", body)
+            if reply.get("error"):
+                errors.append(f"{prompt[:60]}: {reply['error']}")
+            else:
+                started.append((str(reply.get("id") or ""), agent, prompt))
+
+        results: dict[str, str] = {}
+        pending = [aid for aid, _, _ in started if aid]
+        deadline = time.monotonic() + self._WAIT_SECS
+        while pending and time.monotonic() < deadline:
+            await asyncio.sleep(self._POLL_SECS)
+            for aid in list(pending):
+                info = await _gateway_get(f"/api/spawn/{aid}")
+                if info.get("error"):
+                    continue          # unreadable now, possibly alive: keep waiting
+                status = str(info.get("status") or "").lower()
+                if info.get("done") is True or status in self._TERMINAL:
+                    body_text = str(info.get("result") or info.get("summary") or "")
+                    results[aid] = body_text if body_text.strip() else f"({status or 'done'})"
+                    pending.remove(aid)
+
+        lines: list[str] = []
+        if started:
+            lines.append(f"Spawned {len(started)} sub-agent(s).")
+        for aid, agent, prompt in started:
+            label = f"{aid} ({agent})" if agent else (aid or "?")
+            if aid in results:
+                lines.append(f"  {label} — {prompt[:80]}\n{results[aid]}")
+            else:
+                lines.append(f"  {label} — STILL RUNNING: {prompt[:80]}")
+        if pending:
+            lines.append(
+                "\nThose sub-agents had not finished within the wait. Poll with "
+                "spawn_list / spawn_status (their completion events still arrive)."
+            )
+        if errors:
+            lines.append(f"\n❌ {len(errors)} agent(s) did not start:")
+            lines.extend(f"  - {e}" for e in errors)
+        if not started and not errors:
+            lines.append("Error: no sub-agents started.")
+        return "\n".join(lines)
+
+
 # ── Auto-register all handlers ───────────────────────────────────────────────
 
 def register_all_builtins() -> None:
@@ -652,5 +842,6 @@ def register_all_builtins() -> None:
         # chat_runner.py can authenticate it via mcp_server_name.
         SpawnRunHandler(),
         SpawnListHandler(),
+        SpawnSubAgentsHandler(),
     )
     logger.info("McpHandlerRegistry: registered %d handlers", len(McpHandlerRegistry._handlers))
