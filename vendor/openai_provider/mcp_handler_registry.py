@@ -1024,21 +1024,26 @@ class SessionCreateHandler(McpHandler):
                             "type": "string",
                             "description": "persistent (default) or another mode crew accepts",
                         },
-                        "folder_id": {"type": "string", "description": "Session folder id to file it into"},
+                        "folder": {"type": "string", "description": "Session folder name or id to file it into"},
+                        "folder_id": {"type": "string", "description": "Session folder id (alias of folder)"},
                     },
-                    "required": ["title"],
                 },
             },
         }
 
     async def execute(self, args: dict) -> str:
         body: dict[str, Any] = {}
-        for field in ("title", "agent", "agent_kind", "model", "memory_mode", "folder_id"):
+        for field in ("title", "agent", "agent_kind", "model", "memory_mode"):
             value = args.get(field)
             if isinstance(value, str) and value.strip():
                 body[field] = value.strip()[:200]
-        if not body.get("title"):
-            return "Error: title is required (say what the session is for)"
+        # crew's own schema calls it `folder`; the create route calls it
+        # `folder_id`. Accept both rather than making the model learn ours.
+        folder = args.get("folder_id") or args.get("folder")
+        if isinstance(folder, str) and folder.strip():
+            body["folder_id"] = folder.strip()[:200]
+        if not body.get("title") and not body.get("agent"):
+            return "Error: give at least a title or an agent (say what the session is for)"
         d = await _gateway_post("/api/chat/slots", body)
         if d.get("error"):
             return f"Error: {d['error']}"

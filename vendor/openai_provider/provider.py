@@ -143,7 +143,10 @@ def _live_session_key(own: "str | None") -> str:
     identity is unresolved.
     """
     key = str(own or "").strip()
-    if key:
+    # "_bg" / "_hb" / "_consolidate" are KiroCrew's own sentinels, not session
+    # keys: crew excludes them from proven identity, so publishing one as a
+    # parent_session names a session that cannot exist.
+    if key and not key.startswith("_"):
         return key
     try:
         path = os.path.join(os.path.expanduser("~"), ".kiro", "crew", "open_slots.json")
@@ -1057,8 +1060,12 @@ class OpenAIProvider(LLMProvider):
                                           if n in _CORE_TOOL_NAMES)[:200],
                 )
                 tools = kept
+        # The bridge's own tools ride on EVERY return path below: each early
+        # return is a turn where the model would otherwise be unable to call a
+        # tool this build implements (session_create is on none of crew's lists).
+        extras = self._bridge_only_defs({_tool_name(t) for t in tools})
         if not self._tool_defer:
-            return tools
+            return tools + extras
         core = [t for t in tools if _tool_name(t) in _CORE_TOOL_NAMES]
         loaded = [
             t for t in tools
@@ -1066,11 +1073,10 @@ class OpenAIProvider(LLMProvider):
         ]
         if not core:
             # Names this build does not know: never guess a subset.
-            return tools
+            return tools + extras
         if len(core) + len(loaded) >= len(tools):
-            return tools
-        sent = core + loaded + [_TOOL_SEARCH_DEF]
-        sent = sent + self._bridge_only_defs({_tool_name(t) for t in sent})
+            return tools + extras
+        sent = core + loaded + [_TOOL_SEARCH_DEF] + extras
         _trace(
             "tools",
             sent=len(sent),

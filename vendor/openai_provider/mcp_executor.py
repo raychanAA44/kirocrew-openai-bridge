@@ -140,6 +140,15 @@ _MANAGED_SERVER_MODULES = {
 }
 
 
+def _configured_server_names() -> set[str]:
+    """MCP servers crew actually configures, i.e. the ones with a launch spec."""
+    try:
+        from kiro_crew.mcp_discovery import list_servers
+        return {s.name for s in list_servers() if not s.disabled and s.command}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
 def _discover_managed_tools() -> tuple[list[dict], dict[str, list[str]]]:
     """Discover tools from managed MCP servers by calling _list_tools() in-process.
 
@@ -152,7 +161,14 @@ def _discover_managed_tools() -> tuple[list[dict], dict[str, list[str]]]:
     """
     tools: list[dict] = []
     tools_by_server: dict[str, list[str]] = {}
+    configured = _configured_server_names()
     for server_name, module_name in _MANAGED_SERVER_MODULES.items():
+        # A module's tools can be listed in-process whether or not crew runs that
+        # server, but only a CONFIGURED server has a launch spec, and only a
+        # launchable server can execute. Discovering the rest advertised 61 tools
+        # (dashboard 37, panel 11, work 5, ...) that could only fail on call.
+        if configured and server_name not in configured:
+            continue
         try:
             module = importlib.import_module(module_name)
             server_tools = module._list_tools()
