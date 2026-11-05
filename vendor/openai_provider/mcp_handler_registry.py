@@ -611,6 +611,36 @@ async def _gateway_get(path: str) -> dict:
     )
 
 
+def _gateway_delete_sync(path: str, secret: str, session_key: str, api: str, token: str = "") -> dict:
+    """Blocking DELETE from the gateway loopback API. Runs in the thread pool."""
+    import urllib.error
+    import urllib.request
+
+    headers = _session_headers(secret, session_key, token)
+    req = urllib.request.Request(f"{api}{path}", headers=headers, method="DELETE")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        try:
+            return {"error": json.loads(e.read()).get("error", str(e))}
+        except Exception:
+            return {"error": str(e)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def _gateway_delete(path: str) -> dict:
+    """DELETE on the gateway loopback API (non-blocking via thread pool)."""
+    import asyncio
+
+    api = _resolve_gateway_api()
+    _, token = _bound_identity()
+    return await asyncio.to_thread(
+        _gateway_delete_sync, path, _internal_secret(), _resolve_session_key(), api, token
+    )
+
+
 # ── ask_question ─────────────────────────────────────────────────────────────
 
 class AskQuestionHandler(McpHandler):
@@ -677,6 +707,15 @@ class AskQuestionHandler(McpHandler):
 
 # ── spawn_run ────────────────────────────────────────────────────────────────
 
+#: Turns a spawned sub-agent gets when the caller names no budget. KiroCrew's
+#: default is 0 = unlimited, and an unlimited run that starts repeating a tool
+#: never stops on its own: one observed run made 236 execute_bash calls in six
+#: minutes, 131 turns, context 9.6k -> 40k, and ended only when it was abandoned.
+_DEFAULT_MAX_TURNS = 40
+
+
+# ── spawn_run ────────────────────────────────────────────────────────────────
+
 class SpawnRunHandler(McpHandler):
     """Proxies spawn_run to KiroCrew gateway HTTP API (POST /api/spawn)."""
 
@@ -726,7 +765,7 @@ class SpawnRunHandler(McpHandler):
         parent_session = _resolve_session_key()
         agent = args.get("agent") or ""
         agents_list = args.get("agents") or []
-        max_turns = args.get("max_turns") or 0
+        max_turns = args.get("max_turns") or _DEFAULT_MAX_TURNS
         cwd = args.get("cwd") or ""
         model = args.get("model") or ""
         keep = bool(args.get("keep"))
@@ -828,6 +867,8 @@ class SpawnSubAgentsHandler(McpHandler):
     #: long wave inside one tool call only makes the turn feel dead.
     _WAIT_SECS = 30.0
     _POLL_SECS = 2.0
+    #: Same last_tool for this many turns, while turns keep climbing, is a loop.
+    _LOOP_TURNS = 12
     #: Statuses that mean the run will not change again.
     _TERMINAL = frozenset({"done", "completed", "failed", "error", "cancelled",
                            "canceled", "stopped", "orphaned"})
@@ -893,7 +934,7 @@ class SpawnSubAgentsHandler(McpHandler):
 
         parent_session = _resolve_session_key()
         cwd = args.get("cwd") or ""
-        max_turns = args.get("max_turns") or 0
+        max_turns = args.get("max_turns") or _DEFAULT_MAX_TURNS
         inc_memory = args.get("include_memory", True) is not False
         inc_lessons = args.get("include_lessons", True) is not False
         inc_project = args.get("include_project", True) is not False
@@ -939,6 +980,8 @@ class SpawnSubAgentsHandler(McpHandler):
 
         results: dict[str, str] = {}
         pending = [aid for aid, _, _ in started if aid]
+        watch: dict[str, dict] = {}
+        notes: list[str] = []
         deadline = time.monotonic() + self._WAIT_SECS
         while pending and time.monotonic() < deadline:
             await asyncio.sleep(self._POLL_SECS)
@@ -946,6 +989,11 @@ class SpawnSubAgentsHandler(McpHandler):
                 info = await _gateway_get(f"/api/spawn/{aid}")
                 if info.get("error"):
                     continue          # unreadable now, possibly alive: keep waiting
+                await self._watch_for_loop(aid, info, watch, notes)
+                if watch.get(aid, {}).get("stopped"):
+                    results[aid] = "(stopped: repeating the same tool with no progress)"
+                    pending.remove(aid)
+                    continue
                 status = str(info.get("status") or "").lower()
                 if info.get("done") is True or status in self._TERMINAL:
                     body_text = str(info.get("result") or info.get("summary") or "")
@@ -969,9 +1017,48 @@ class SpawnSubAgentsHandler(McpHandler):
         if errors:
             lines.append(f"\n❌ {len(errors)} agent(s) did not start:")
             lines.extend(f"  - {e}" for e in errors)
+        if notes:
+            lines.append("\n" + "\n".join(notes))
         if not started and not errors:
             lines.append("Error: no sub-agents started.")
         return "\n".join(lines)
+
+    async def _watch_for_loop(self, aid: str, info: dict, watch: dict, notes: list) -> None:
+        """Break a sub-agent that keeps calling one tool without finishing.
+
+        A run is not stuck because it is slow; it is stuck when the SAME tool is
+        its last tool for many turns while its turn count keeps climbing -- the
+        shape one real run had (236 execute_bash calls, 131 turns, no result).
+        The first sighting steers an interrupt into the run; if it keeps going
+        past twice that window, the run is stopped rather than left burning.
+        """
+        turns = int(info.get("turns") or 0)
+        tool = str(info.get("last_tool") or "").strip()
+        state = watch.setdefault(aid, {"tool": "", "since": turns, "steered": False})
+        if tool != state["tool"]:
+            state.update(tool=tool, since=turns, steered=False)
+            return
+        if not tool:
+            return
+        repeats = turns - state["since"]
+        if repeats < self._LOOP_TURNS:
+            return
+        if not state["steered"]:
+            state["steered"] = True
+            await _gateway_post(f"/api/spawn/{aid}/steer", {
+                "message": (
+                    f"You have called {tool} {repeats} turns in a row without making "
+                    f"progress. Stop repeating it. Report what you have, state what "
+                    f"blocked you, and end your turn."
+                ),
+                "mode": "interrupt",
+            })
+            notes.append(f"{aid}: steered after {repeats} repeated {tool} calls")
+            return
+        if repeats >= self._LOOP_TURNS * 2:
+            await _gateway_delete(f"/api/spawn/{aid}")
+            state["stopped"] = True
+            notes.append(f"{aid}: stopped after steer did not break the {tool} loop")
 
 
 # ── spawn_status ─────────────────────────────────────────────────────────────
