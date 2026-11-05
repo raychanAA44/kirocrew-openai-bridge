@@ -91,8 +91,15 @@ def _child_env() -> dict[str, str]:
     token = identity.get("token") or ""
     if key:
         env["KIROCREW_SESSION_KEY"] = key
+    else:
+        # Inheriting a stale key is worse than having none: the child would
+        # declare a session that is not the one whose tool is running, and the
+        # call gets attributed to whoever left that variable behind.
+        env.pop("KIROCREW_SESSION_KEY", None)
     if token:
         env["KIROCREW_STUB_SESSION_TOKEN"] = token
+    else:
+        env.pop("KIROCREW_STUB_SESSION_TOKEN", None)
     return env
 
 

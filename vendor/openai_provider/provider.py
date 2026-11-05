@@ -131,7 +131,16 @@ def _live_session_key(own: "str | None") -> str:
     The provider factory hands over ``session_key=None`` for dashboard chats, and
     KiroCrew attributes background work through mcp_core._resolve_session_key().
     Without a key spawn_run stored parent_session="" and the dashboard could not
-    place the subagent. Fall back to the most recently opened slot.
+    place the subagent.
+
+    The fallback used to take ``open_slots.json``'s last key, which is a GUESS:
+    that file records a SET and its order carries no meaning to any reader
+    (crew's own reader says so). Observed live with two slots open -- chat-12
+    was the live conversation, ``keys[-1]`` was chat-10 -- so a spawned subagent
+    would have been published under the OTHER conversation, which is worse than
+    an empty parent: the run is attributed to someone else. Only an unambiguous
+    single open slot is used; anything else returns "" and lets KiroCrew say the
+    identity is unresolved.
     """
     key = str(own or "").strip()
     if key:
@@ -140,8 +149,8 @@ def _live_session_key(own: "str | None") -> str:
         path = os.path.join(os.path.expanduser("~"), ".kiro", "crew", "open_slots.json")
         with open(path, encoding="utf-8-sig") as fh:
             keys = json.load(fh).get("keys") or []
-        if keys:
-            return "dashboard:" + str(keys[-1])
+        if len(keys) == 1:
+            return "dashboard:" + str(keys[0])
     except Exception:  # noqa: BLE001
         pass
     return ""
