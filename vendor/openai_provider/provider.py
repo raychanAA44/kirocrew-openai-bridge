@@ -189,16 +189,22 @@ _TOOL_SEARCH_DEF = {
     "function": {
         "name": _TOOL_SEARCH_NAME,
         "description": (
-            "Load more tools. Only the core tools are sent with each request; call "
-            "this with a few keywords (or exact names) and the matching tools "
-            "become callable immediately. Example: {\"query\": \"cron schedule\"}."
+            "Load more tools. Only the core tools are sent with each request. Pass "
+            "`names` with exact tool names when you know them -- that always works. "
+            "Otherwise pass `query`: single words, matched ONE BY ONE against tool "
+            "names and descriptions (not as a phrase), so {\"query\": \"cron\"} and "
+            "{\"query\": \"ledger monitor session\"} both work. Loaded tools stay "
+            "callable for the rest of the session."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Keywords describing what you need to do.",
+                    "description": (
+                        "A few separate words describing what you need to do. "
+                        "Each word is matched on its own."
+                    ),
                 },
                 "names": {
                     "type": "array",
@@ -206,7 +212,6 @@ _TOOL_SEARCH_DEF = {
                     "description": "Exact tool names, when you already know them.",
                 },
             },
-            "required": ["query"],
         },
     },
 }
@@ -233,6 +238,62 @@ def _tool_params(entry: dict) -> str:
         for name in props
     ]
     return ", ".join(names)
+
+
+#: Words a tool query carries no signal in ("create the record for me").
+_QUERY_STOPWORDS = frozenset({
+    "a", "an", "and", "are", "as", "at", "be", "by", "can", "do", "for", "from",
+    "i", "in", "is", "it", "me", "my", "of", "on", "or", "please", "so", "that",
+    "the", "then", "this", "to", "tool", "tools", "use", "want", "with",
+})
+
+_WORD_RE = _re.compile(r"[a-z0-9]+")
+
+
+def _words(text: str) -> list[str]:
+    """Split *text* into lowercase words: snake, camel, punctuation all peel apart.
+
+    A model asks for tools with a BAG of words ("work ledger record create bind
+    session create send monitor_start"), so the unit of matching is the word, not
+    the phrase. Words of one character are dropped here, which also retires
+    "a"/"i" without a stopword entry each.
+    """
+    spaced = _re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", str(text or ""))
+    return [
+        word for word in _WORD_RE.findall(spaced.lower())
+        if len(word) > 1 and word not in _QUERY_STOPWORDS
+    ]
+
+
+def _score_tools(terms: list[str], pool: list[dict]) -> list[tuple[int, str]]:
+    """Rank tools by how many query words their name / description carry.
+
+    A hit on the tool's own name is worth four times a hit in its description:
+    "monitor" in ``monitor_start`` says much more than "monitor" in some
+    description's prose. A shared prefix (``schedul`` vs ``schedule``) counts
+    half, which is what lets a slightly misspelled word still land.
+    """
+    if not terms:
+        return []
+    scored: list[tuple[int, str]] = []
+    for entry in pool:
+        name = _tool_name(entry)
+        if not name or name in _CORE_TOOL_NAMES:
+            continue
+        name_terms = set(_words(name))
+        desc_terms = set(_words(_tool_description(entry, 4000)))
+        score = 0
+        for term in terms:
+            if term in name_terms:
+                score += 4
+            elif any(t.startswith(term) or term.startswith(t) for t in name_terms):
+                score += 2
+            if term in desc_terms:
+                score += 1
+        if score:
+            scored.append((score, name))
+    scored.sort(key=lambda pair: (-pair[0], pair[1]))
+    return scored
 
 
 class _StreamedResponse:
@@ -964,33 +1025,47 @@ class OpenAIProvider(LLMProvider):
         return sent
 
     def _load_tools(self, names: list[str], query: str) -> str:
-        """Activate tools matching *names* / *query*; answer with what was loaded."""
+        """Activate tools named in *names* or matched by *query*; say what loaded.
+
+        Two ways in, and the exact names always win: a model that already knows
+        the tool must not be second-guessed by word matching. The query path is
+        deliberately word-by-word -- an earlier contiguous-substring test missed
+        every real query a model sent, which is how "No tool matched" became a
+        dead end instead of a tool call.
+        """
         pool = self._all_tools or []
         by_name = {_tool_name(t): t for t in pool}
         chosen: list[str] = []
         for name in names:
             name = str(name or "").strip()
-            if name in by_name:
+            if name in by_name and name not in chosen:
                 chosen.append(name)
-        if not chosen and query:
-            needle = str(query).strip().lower()
-            scored: list[tuple[int, str]] = []
-            for entry in pool:
-                name = _tool_name(entry)
-                if not name or name in _CORE_TOOL_NAMES:
-                    continue
-                haystack = f"{name} {_tool_description(entry, 4000)}".lower()
-                if needle and needle in haystack:
-                    scored.append((0 if needle in name.lower() else 1, name))
-            scored.sort()
-            chosen = [name for _, name in scored[:8]]
+        ranked = _score_tools(_words(query), pool) if query else []
+        for _, name in ranked[:8]:
+            if name not in chosen:
+                chosen.append(name)
+        chosen = chosen[:12]
         fresh = [name for name in chosen if name not in self._activated_tools]
         self._activated_tools.update(chosen)
-        _trace("tools_loaded", names=",".join(chosen)[:200], fresh=len(fresh))
+        _trace(
+            "tools_loaded",
+            query=str(query or "")[:160],
+            candidates=len(ranked),
+            names=",".join(chosen)[:200],
+            fresh=len(fresh),
+        )
         if not chosen:
-            return (
-                "No tool matched. Try different keywords, or name the tool exactly."
+            available = sorted(
+                name for name in by_name
+                if name and name not in _CORE_TOOL_NAMES
             )
+            head = available[:40]
+            return "\n".join([
+                "No tool matched those words, so nothing was loaded.",
+                f"{len(available)} more tools are available. Call tool_search again "
+                f"with names: [\"<exact name>\"], or with different words.",
+                ", ".join(head) + (" ..." if len(available) > len(head) else ""),
+            ])
         lines = ["Loaded (callable from now on):"]
         for name in chosen:
             entry = by_name[name]
