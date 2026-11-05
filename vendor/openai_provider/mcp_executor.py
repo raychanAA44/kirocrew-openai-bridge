@@ -286,31 +286,36 @@ _server_info: dict[str, dict] = {}  # server_name → {command, args, env}
 
 
 def _build_tool_server_map(tools_by_server: dict[str, list[str]] | None = None) -> None:
-    """Build mapping from tool names to server names.
+    """Build the tool → server map plus the per-server launch info.
 
-    Args:
-        tools_by_server: Optional dict mapping server_name → list of tool names.
-            If provided, uses this directly. Otherwise, uses mcp_discovery.
+    Ownership comes from the DISCOVERY result, not from what ``list_servers()``
+    happens to enumerate: a server that answered ``tools/list`` owns its tools
+    even when the config reader does not name it, and silently dropping that
+    ownership is exactly how a call becomes unroutable. ``list_servers()`` is
+    still what supplies each server's command, so it alone can be spawned.
     """
     try:
         from kiro_crew.mcp_discovery import list_servers
-        for server in list_servers():
-            if server.disabled or not server.command:
-                continue
-            _server_info[server.name] = {
-                "command": server.command,
-                "args": server.args or [],
-            }
-            # Map tool names to server names
-            if tools_by_server and server.name in tools_by_server:
-                for tool_name in tools_by_server[server.name]:
-                    _tool_server_map[tool_name] = server.name
-            elif hasattr(server, 'tools') and server.tools:
-                for tool_name in server.tools:
-                    if isinstance(tool_name, str):
-                        _tool_server_map[tool_name] = server.name
+        servers = list_servers()
     except ImportError:
-        pass
+        servers = []
+    for server in servers:
+        if server.disabled or not server.command:
+            continue
+        _server_info[server.name] = {
+            "command": server.command,
+            "args": server.args or [],
+        }
+    for server_name, tool_names in (tools_by_server or {}).items():
+        for tool_name in tool_names:
+            if isinstance(tool_name, str):
+                _tool_server_map[tool_name] = server_name
+    for server in servers:
+        if server.disabled or not server.command:
+            continue
+        for tool_name in (getattr(server, "tools", None) or []):
+            if isinstance(tool_name, str):
+                _tool_server_map.setdefault(tool_name, server.name)
 
 
 async def _execute_via_mcp_stdio(

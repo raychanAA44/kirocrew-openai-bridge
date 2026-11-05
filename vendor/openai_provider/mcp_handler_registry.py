@@ -780,7 +780,16 @@ class SpawnSubAgentsHandler(McpHandler):
             if reply.get("error"):
                 errors.append(f"{prompt[:60]}: {reply['error']}")
             else:
-                started.append((str(reply.get("id") or ""), agent, prompt))
+                agent_id = str(reply.get("id") or "")
+                if not agent_id:
+                    # Accepted without an id: there is nothing to poll, so say
+                    # so instead of reporting a run that cannot be followed.
+                    errors.append(
+                        f"{prompt[:60]}: gateway accepted it but returned no id "
+                        f"(check spawn_list)"
+                    )
+                else:
+                    started.append((agent_id, agent, prompt))
 
         results: dict[str, str] = {}
         pending = [aid for aid, _, _ in started if aid]
