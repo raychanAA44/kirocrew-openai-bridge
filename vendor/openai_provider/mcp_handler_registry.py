@@ -366,8 +366,29 @@ def _resolve_gateway_api() -> str:
     return "http://localhost:5476"
 
 
+def _bound_identity() -> tuple[str, str]:
+    """The (session key, stub token) bound for the tool call now running.
+
+    The provider stamps both into a contextvar before every call
+    (``mcp_executor.set_tool_identity``) because one gateway process serves every
+    session at once, so they cannot live in ``os.environ``. Reading the
+    environment instead is what stored ``parent_session=""`` on a spawned
+    subagent: the run exists, but the gateway cannot tell whose it is, and
+    ``spawn_status`` answers ``not found`` for it.
+    """
+    try:
+        from .mcp_executor import _TOOL_IDENTITY
+        ident = _TOOL_IDENTITY.get() or {}
+    except Exception:  # noqa: BLE001
+        return "", ""
+    return str(ident.get("session_key") or ""), str(ident.get("token") or "")
+
+
 def _resolve_session_key() -> str:
-    """Resolve session key from env or PID file."""
+    """Resolve the calling session key: bound identity first, then env / pid map."""
+    bound, _ = _bound_identity()
+    if bound:
+        return bound
     sk = os.environ.get("KIROCREW_SESSION_KEY", "")
     if sk:
         return sk
@@ -405,18 +426,32 @@ def _internal_secret() -> str:
         return ""
 
 
-def _gateway_post_sync(path: str, body: dict, secret: str, session_key: str, api: str) -> dict:
+def _session_headers(secret: str, session_key: str, token: str = "") -> dict[str, str]:
+    """Headers every loopback call needs: secret, declared key, signed token.
+
+    KiroCrew authenticates on the secret, then compares the key a request
+    DECLARES against the token it carries; a request with the key but no token
+    is an unattested caller, and a session-scoped read is refused. The pair is
+    bound per call, so it is passed in rather than re-resolved here.
+    """
+    headers = {"X-Internal-Secret": secret}
+    if session_key:
+        headers["X-Session-Key"] = session_key
+        if token:
+            headers["X-Session-Token"] = token
+    return headers
+
+
+def _gateway_post_sync(
+    path: str, body: dict, secret: str, session_key: str, api: str, token: str = ""
+) -> dict:
     """Blocking POST to KiroCrew gateway loopback API. Runs in thread pool."""
     import urllib.request
     import urllib.error
 
     data = json.dumps(body).encode()
-    headers = {
-        "Content-Type": "application/json",
-        "X-Internal-Secret": secret,
-    }
-    if session_key:
-        headers["X-Session-Key"] = session_key
+    headers = {"Content-Type": "application/json"}
+    headers.update(_session_headers(secret, session_key, token))
 
     req = urllib.request.Request(f"{api}{path}", data=data, headers=headers, method="POST")
     try:
@@ -439,17 +474,20 @@ async def _gateway_post(path: str, body: dict) -> dict:
     api = _resolve_gateway_api()
     secret = _internal_secret()
     session_key = _resolve_session_key()
-    return await asyncio.to_thread(_gateway_post_sync, path, body, secret, session_key, api)
+    _, token = _bound_identity()
+    return await asyncio.to_thread(
+        _gateway_post_sync, path, body, secret, session_key, api, token
+    )
 
 
-def _gateway_get_sync(path: str, secret: str, session_key: str, api: str) -> dict:
+def _gateway_get_sync(
+    path: str, secret: str, session_key: str, api: str, token: str = ""
+) -> dict:
     """Blocking GET from the gateway loopback API. Runs in the thread pool."""
     import urllib.error
     import urllib.request
 
-    headers = {"X-Internal-Secret": secret}
-    if session_key:
-        headers["X-Session-Key"] = session_key
+    headers = _session_headers(secret, session_key, token)
     req = urllib.request.Request(f"{api}{path}", headers=headers, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -468,8 +506,9 @@ async def _gateway_get(path: str) -> dict:
     import asyncio
 
     api = _resolve_gateway_api()
+    _, token = _bound_identity()
     return await asyncio.to_thread(
-        _gateway_get_sync, path, _internal_secret(), _resolve_session_key(), api
+        _gateway_get_sync, path, _internal_secret(), _resolve_session_key(), api, token
     )
 
 
@@ -648,7 +687,12 @@ class SpawnListHandler(McpHandler):
         return {"type": "function", "function": {"name": "spawn_list", "description": "List running/completed subagents.", "parameters": {"type": "object", "properties": {}}}}
 
     async def execute(self, args: dict) -> str:
-        d = await _gateway_post("/api/spawn", {})
+        # GET, not POST: POST /api/spawn is the SPAWN route and answers
+        # "task or tasks is required", so this tool used to report a spawn
+        # error as if it were a list. The list lives on GET /api/spawn.
+        d = await _gateway_get("/api/spawn")
+        if d.get("error"):
+            return f"Error: {d['error']}"
         agents = d.get("agents", [])
         if not agents:
             return "No subagents running."
