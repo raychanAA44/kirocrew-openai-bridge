@@ -1,0 +1,31 @@
+diff --git "a/C:\\Users\\Administrator\\AppData\\Local\\kirocrew-openai-bridge\\backups\\agent_policy.py.orig" "b/C:\\Program Files\\KiroCrew\\resources\\backend-dist\\kirocrew-backend\\Lib\\site-packages\\kiro_crew\\subagent_parts\\agent_policy.py"
+index 5e32bb0..3843ddb 100644
+--- "a/C:\\Users\\Administrator\\AppData\\Local\\kirocrew-openai-bridge\\backups\\agent_policy.py.orig"
++++ "b/C:\\Program Files\\KiroCrew\\resources\\backend-dist\\kirocrew-backend\\Lib\\site-packages\\kiro_crew\\subagent_parts\\agent_policy.py"	
+@@ -7,14 +7,13 @@ an agent, the governance vetting of a spawn, the parent spec's
+ 
+ from __future__ import annotations
+ 
++import os
+ import re
+ from typing import TYPE_CHECKING
+ 
+ from kiro_crew.agent_discovery import AgentsDirMemo
+ 
+ if TYPE_CHECKING:
+-    import os
+-
+     from kiro_crew.subagent import (
+         _AGENT_NAME_RE,
+         KIRO_CLI_BUILTIN_AGENTS,
+@@ -938,6 +937,10 @@ def validate_cwd(cwd: str, allowed_roots: list[str]) -> tuple[str, str]:
+         return ("", "cwd does not exist or is not a directory")
+     resolved_roots = [os.path.realpath(os.path.expanduser(r)) for r in allowed_roots]
+     for root in resolved_roots:
++        # A drive root keeps its separator through realpath ("D:/" -> "D:\"), so
++        # comparing against root + os.sep asked for "D:\\" and refused every
++        # path under the drive. Normalise once, then compare.
++        root = root.rstrip("\\/") or root
+         if resolved == root or resolved.startswith(root + os.sep):
+             return (resolved, "")
+     return ("", f"cwd is not under any allowed root: {allowed_roots}")
