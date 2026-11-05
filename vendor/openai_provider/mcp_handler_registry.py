@@ -84,6 +84,39 @@ class McpHandlerRegistry:
 
 # ── Built-in File/Bash/Web Handlers ──────────────────────────────────────────
 
+def _decode_child(raw: bytes) -> str:
+    """Decode a child's output the way the child actually wrote it.
+
+    ``bytes.decode()`` defaults to UTF-8, and a Windows console program writing
+    through a pipe uses the ANSI/OEM code page instead -- so GBK output arrived
+    as replacement characters, the model read its own successful command as
+    garbage, and retried. Try UTF-8 first, then the two Chinese code pages, and
+    only then lose bytes.
+    """
+    for encoding in ("utf-8", "gbk", "cp936"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def _child_shell_env() -> dict[str, str]:
+    """Environment for a shell child: force Python inside it to speak UTF-8.
+
+    A ``python -c`` that prints non-ASCII dies with
+    ``UnicodeEncodeError: 'gbk' codec can't encode`` when stdout is a pipe on a
+    zh-CN Windows, and a script that reads a manifest without an explicit
+    encoding decodes it as GBK. Both make a verification step fail for reasons
+    that have nothing to do with the file being verified, which is exactly the
+    retry loop this prevents.
+    """
+    env = dict(os.environ)
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
+
+
 class BashHandler(McpHandler):
     @property
     def name(self) -> str: return "execute_bash"
@@ -94,10 +127,16 @@ class BashHandler(McpHandler):
     async def execute(self, args: dict) -> str:
         cmd = args.get("command", "")
         if not cmd: return "[Error: command required]"
-        proc = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
-        out = stdout.decode(errors="replace")
-        err = stderr.decode(errors="replace")
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                env=_child_shell_env(),
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+        except asyncio.TimeoutError:
+            return f"[timed out after 30s: {cmd[:200]}]"
+        out = _decode_child(stdout)
+        err = _decode_child(stderr)
         if err: out += f"\n[stderr]\n{err}"
         if proc.returncode: out += f"\n[exit code: {proc.returncode}]"
         return out
@@ -190,9 +229,9 @@ class GrepHandler(McpHandler):
         if args.get("exclude"): cmd.extend(["--exclude", args["exclude"]])
         cmd.extend([pattern, directory])
         try:
-            proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=_child_shell_env())
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
-            out = stdout.decode(errors="replace").strip()
+            out = _decode_child(stdout).strip()
             if proc.returncode == 1: return f"[No matches for '{pattern}']"
             if len(out) > 30000: out = "\n".join(out.splitlines()[:500]) + "\n...(truncated)"
             return out or f"[No matches]"
@@ -229,9 +268,9 @@ class FindHandler(McpHandler):
         if args.get("name"): cmd.extend(["-name", args["name"]])
         if args.get("type") in ("f", "d"): cmd.extend(["-type", args["type"]])
         try:
-            proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=_child_shell_env())
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
-            out = stdout.decode(errors="replace").strip()
+            out = _decode_child(stdout).strip()
             if not out: return "[No results]"
             lines = out.splitlines()
             if len(lines) > 200: return "\n".join(lines[:200]) + f"\n... ({len(lines)} total)"
