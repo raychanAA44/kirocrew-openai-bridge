@@ -156,6 +156,84 @@ _TRACE_PATH = os.path.join(
 #: are the usual transient upstream answers.
 _RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
 
+# ── On-demand tool loading ───────────────────────────────────────────────────
+#
+# KiroCrew inlines its whole MCP tool set on every request: measured here 125
+# tools / 143,184 characters ≈ 27k tokens, and the prefill over them costs
+# +1501 ms per turn EVEN at a 99.8% prompt-cache hit. Only a handful are used in
+# any given turn, so this sends a core set plus a `tool_search` loader and adds a
+# tool to the wire once the model asks for it (matches stay active for the rest
+# of the session).
+#
+# HUB_TOOL_DEFER=0 turns the whole thing off (the full set is then sent, exactly
+# as before). A 400 that mentions tools/function switches it off for the session
+# automatically and retries once, so a gateway that dislikes the loader cannot
+# wedge a chat.
+_TOOL_DEFER = os.environ.get("HUB_TOOL_DEFER", "1") != "0"
+
+#: Sent on every turn while deferral is on: the file/code/search essentials plus
+#: the two spawn/ask entry points a chat needs to stay useful. Everything else is
+#: reachable through `tool_search`.
+_CORE_TOOL_NAMES = frozenset({
+    "read", "write", "edit", "list_dir", "find", "grep", "glob", "execute_bash",
+    "web_fetch", "web_search",
+    "kb_read", "kb_list", "kb_search", "kb_write",
+    "memory_recall", "save_notes",
+    "spawn_sub_agents", "ask_question",
+})
+
+_TOOL_SEARCH_NAME = "tool_search"
+
+_TOOL_SEARCH_DEF = {
+    "type": "function",
+    "function": {
+        "name": _TOOL_SEARCH_NAME,
+        "description": (
+            "Load more tools. Only the core tools are sent with each request; call "
+            "this with a few keywords (or exact names) and the matching tools "
+            "become callable immediately. Example: {\"query\": \"cron schedule\"}."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Keywords describing what you need to do.",
+                },
+                "names": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Exact tool names, when you already know them.",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+
+def _tool_name(entry: dict) -> str:
+    fn = entry.get("function") if isinstance(entry.get("function"), dict) else entry
+    return str(fn.get("name") or "")
+
+
+def _tool_description(entry: dict, limit: int = 200) -> str:
+    fn = entry.get("function") if isinstance(entry.get("function"), dict) else entry
+    text = " ".join(str(fn.get("description") or "").split())
+    return text[:limit]
+
+
+def _tool_params(entry: dict) -> str:
+    fn = entry.get("function") if isinstance(entry.get("function"), dict) else entry
+    params = fn.get("parameters") or {}
+    props = params.get("properties") or {}
+    required = set(params.get("required") or [])
+    names = [
+        f"{name}*" if name in required else name
+        for name in props
+    ]
+    return ", ".join(names)
+
 
 class _StreamedResponse:
     """``async with`` wrapper for a streamed ``httpx.Response``.
@@ -566,6 +644,13 @@ class OpenAIProvider(LLMProvider):
         # model actually accepts, so a level configured for the chat model is never
         # sent to a subagent model that would 400 on it.
         self._reasoning_effort = _effort_for_model(self._model, reasoning_effort)
+        # On-demand tool loading (see _CORE_TOOL_NAMES): the core set plus any tool
+        # this session has already asked for is what goes on the wire.
+        self._tool_defer = _TOOL_DEFER
+        self._activated_tools: set[str] = set()
+        self._tool_retry_done = False
+        #: The full set the caller handed us this turn -- what _load_tools searches.
+        self._all_tools: list[dict] = []
 
         # Context window for reporting (separate from max_tokens output limit)
         # If not provided, will be resolved from /v1/models in start()
@@ -849,6 +934,74 @@ class OpenAIProvider(LLMProvider):
                 raise last_error  # type: ignore[misc]
             return _StreamedResponse(resp)
         return _StreamedResponse(last) if last is not None else last
+
+    def _wire_tools(self, tools: list[dict]) -> list[dict]:
+        """The tool list to send: core + already-loaded, else the whole set.
+
+        Deferral only pays when there is something to defer, so a set that is
+        already small (or a provider with deferral switched off) passes through
+        untouched -- including when the model answered a 400 earlier.
+        """
+        if not self._tool_defer or not tools:
+            return tools
+        core = [t for t in tools if _tool_name(t) in _CORE_TOOL_NAMES]
+        loaded = [
+            t for t in tools
+            if _tool_name(t) in self._activated_tools and _tool_name(t) not in _CORE_TOOL_NAMES
+        ]
+        if not core:
+            # Names this build does not know: never guess a subset.
+            return tools
+        if len(core) + len(loaded) >= len(tools):
+            return tools
+        sent = core + loaded + [_TOOL_SEARCH_DEF]
+        _trace(
+            "tools",
+            sent=len(sent),
+            of=len(tools),
+            chars=sum(len(json.dumps(t, ensure_ascii=False)) for t in sent),
+        )
+        return sent
+
+    def _load_tools(self, names: list[str], query: str) -> str:
+        """Activate tools matching *names* / *query*; answer with what was loaded."""
+        pool = self._all_tools or []
+        by_name = {_tool_name(t): t for t in pool}
+        chosen: list[str] = []
+        for name in names:
+            name = str(name or "").strip()
+            if name in by_name:
+                chosen.append(name)
+        if not chosen and query:
+            needle = str(query).strip().lower()
+            scored: list[tuple[int, str]] = []
+            for entry in pool:
+                name = _tool_name(entry)
+                if not name or name in _CORE_TOOL_NAMES:
+                    continue
+                haystack = f"{name} {_tool_description(entry, 4000)}".lower()
+                if needle and needle in haystack:
+                    scored.append((0 if needle in name.lower() else 1, name))
+            scored.sort()
+            chosen = [name for _, name in scored[:8]]
+        fresh = [name for name in chosen if name not in self._activated_tools]
+        self._activated_tools.update(chosen)
+        _trace("tools_loaded", names=",".join(chosen)[:200], fresh=len(fresh))
+        if not chosen:
+            return (
+                "No tool matched. Try different keywords, or name the tool exactly."
+            )
+        lines = ["Loaded (callable from now on):"]
+        for name in chosen:
+            entry = by_name[name]
+            params = _tool_params(entry)
+            lines.append(
+                f"- {name}({params})" if params else f"- {name}"
+            )
+            desc = _tool_description(entry)
+            if desc:
+                lines.append(f"  {desc}")
+        return "\n".join(lines)
 
     def _chat_base_url(self) -> str:
         """Which endpoint this turn's chat request goes to.
@@ -1428,7 +1581,10 @@ class OpenAIProvider(LLMProvider):
         if self._reasoning_effort:
             payload["reasoning_effort"] = self._reasoning_effort
         if tools:
-            payload["tools"] = tools
+            # Deferral rewrites this list (see _wire_tools); keep the full set so
+            # `tool_search` can reach everything the caller offered.
+            self._all_tools = tools
+            payload["tools"] = self._wire_tools(tools)
             payload["tool_choice"] = "auto"
 
         # An empty key used to surface as httpx's "Illegal header value b'Bearer '"
@@ -1462,6 +1618,24 @@ class OpenAIProvider(LLMProvider):
             async with await self._open_stream(client, payload, headers) as resp:
                 if resp.status_code != 200:
                     body = await resp.aread()
+                    if (
+                        resp.status_code == 400
+                        and self._tool_defer
+                        and not self._tool_retry_done
+                        and b"tool" in body.lower()
+                    ):
+                        # A gateway that rejects the deferred list must not wedge the
+                        # chat: drop back to the full set and re-run this request once.
+                        self._tool_retry_done = True
+                        self._tool_defer = False
+                        _trace(
+                            "tool_defer_off",
+                            status=resp.status_code,
+                            reason=body[:160].decode("utf-8", "replace"),
+                        )
+                        async for _ev in self._stream_completion(tools):
+                            yield _ev
+                        return
                     raise RuntimeError(
                         f"OpenAI API error {resp.status_code}: {body.decode()[:500]}"
                     )
@@ -1498,12 +1672,24 @@ class OpenAIProvider(LLMProvider):
                             requested=payload["model"],
                             served=chunk.get("model"),
                             session=self._session_key,
+                            tools=len(payload.get("tools") or []),
+                            pt=(chunk.get("usage") or {}).get("prompt_tokens"),
                         )
 
                     # Usage (last chunk on many providers)
                     if usage := chunk.get("usage"):
                         pt = int(usage.get("prompt_tokens") or 0)
                         ct = int(usage.get("completion_tokens") or 0)
+                        # Which tool list this turn actually paid for: deferral's
+                        # whole claim is that `pt` drops, so record both numbers.
+                        _trace(
+                            "usage",
+                            requested=payload["model"],
+                            pt=pt,
+                            ct=ct,
+                            tools=len(payload.get("tools") or []),
+                            session=self._session_key,
+                        )
                         # "Context used" is what the NEXT request has to carry: the
                         # prompt. Adding completion_tokens reported the model's own
                         # output as if it occupied the window, so the meter ran ahead
@@ -1573,6 +1759,59 @@ class OpenAIProvider(LLMProvider):
 
         tool_call_id = tc.get("id") or str(uuid.uuid4())
         request_id = str(uuid.uuid4())
+
+        # ── On-demand tool loading: the loader itself, and the guard for a tool
+        # the model named but was never sent (a hallucinated or remembered name).
+        # Both answer as ordinary tool results so the model can correct course in
+        # the same turn instead of the request failing on an unknown function.
+        if fn_name == _TOOL_SEARCH_NAME:
+            yield AcpEvent(
+                kind=EVENT_TOOL_CALL,
+                tool_call_id=tool_call_id,
+                title="tool_search",
+                tool_name=fn_name,
+                tool_purpose="load tools",
+                tool_input=json.dumps(fn_args, ensure_ascii=False),
+                mcp_server_name="",
+            )
+            text = self._load_tools(
+                fn_args.get("names") or [], str(fn_args.get("query") or ""),
+            )
+            yield AcpEvent(
+                kind=EVENT_TOOL_RESULT,
+                tool_call_id=tool_call_id,
+                tool_output=text,
+                tool_final=True,
+                mcp_server_name="",
+            )
+            return
+        if (
+            self._tool_defer
+            and self._all_tools
+            and fn_name not in _CORE_TOOL_NAMES
+            and fn_name not in self._activated_tools
+            and any(_tool_name(t) == fn_name for t in self._all_tools)
+        ):
+            yield AcpEvent(
+                kind=EVENT_TOOL_CALL,
+                tool_call_id=tool_call_id,
+                title=f"{fn_name} (not loaded)",
+                tool_name=fn_name,
+                tool_purpose="not loaded",
+                tool_input=json.dumps(fn_args, ensure_ascii=False),
+                mcp_server_name="",
+            )
+            yield AcpEvent(
+                kind=EVENT_TOOL_RESULT,
+                tool_call_id=tool_call_id,
+                tool_output=(
+                    f"{fn_name} is not loaded in this request. Call tool_search with "
+                    f"names: [\"{fn_name}\"] first, then call it again."
+                ),
+                tool_final=True,
+                mcp_server_name="",
+            )
+            return
 
         # Announce tool call to dashboard
         purpose = fn_args.pop("__tool_use_purpose", "") or fn_name
