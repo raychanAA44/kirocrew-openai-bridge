@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import re as _re
+import subprocess
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
@@ -27,7 +28,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-def _kill_child(proc: Any) -> None:
+async def _kill_child(proc: Any) -> None:
     """End a spawned child AND everything it spawned.
 
     ``proc.kill()`` is one handle: on Windows ``create_subprocess_shell`` runs
@@ -39,17 +40,30 @@ def _kill_child(proc: Any) -> None:
         return
     try:
         if os.name == "nt":
-            import subprocess
-
-            subprocess.run(
+            # taskkill blocks for as long as the tree takes to die; off-load it
+            # so a slow kill cannot stall the event loop the caller runs on.
+            await asyncio.to_thread(
+                subprocess.run,
                 ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                timeout=10, check=False,
+                timeout=3, check=False,
             )
         else:
             proc.kill()
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("openai_provider: could not kill child tree: %s", exc)
+    # Killing the tree does not reap it: an unreaped child stays a zombie and
+    # its pipes stay open, so collect the exit status before dropping the handle.
+    try:
+        await asyncio.wait_for(proc.wait(), 1.0)
     except Exception:  # noqa: BLE001
         pass
+    transport = getattr(proc, "transport", None)
+    if transport is not None:
+        try:
+            transport.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ── Base Handler ─────────────────────────────────────────────────────────────
@@ -216,7 +230,7 @@ class BashHandler(McpHandler):
         except asyncio.TimeoutError:
             return f"[timed out after 30s: {cmd[:200]}]"
         finally:
-            _kill_child(proc)
+            await _kill_child(proc)
         out = _decode_child(stdout)
         err = _decode_child(stderr)
         if err: out += f"\n[stderr]\n{err}"
@@ -325,7 +339,7 @@ class GrepHandler(McpHandler):
             if len(out) > 30000: out = "\n".join(out.splitlines()[:500]) + "\n...(truncated)"
             return out or f"[No matches]"
         except asyncio.TimeoutError: return "[grep timed out]"
-        finally: _kill_child(proc)
+        finally: await _kill_child(proc)
 
 
 class GlobHandler(McpHandler):
@@ -367,7 +381,7 @@ class FindHandler(McpHandler):
             if len(lines) > 200: return "\n".join(lines[:200]) + f"\n... ({len(lines)} total)"
             return out
         except asyncio.TimeoutError: return "[find timed out]"
-        finally: _kill_child(proc)
+        finally: await _kill_child(proc)
 
 
 class ListDirHandler(McpHandler):
@@ -412,7 +426,7 @@ class WebFetchHandler(McpHandler):
             if len(content) > max_len: content = content[:max_len] + f"\n...(truncated at {max_len})"
             return content
         except asyncio.TimeoutError: return f"[Fetch timed out: {url}]"
-        finally: _kill_child(proc)
+        finally: await _kill_child(proc)
 
 
 class WebSearchHandler(McpHandler):

@@ -266,7 +266,13 @@ def _snapshot_age_secs() -> float:
     try:
         with open(_snapshot_path(), encoding="utf-8") as fh:
             payload = json.load(fh)
-        return max(0.0, time.time() - float(payload.get("fetched_at") or 0.0))
+        # A missing/0/non-numeric stamp is unknown, not "written at epoch":
+        # ``or 0.0`` turned that into an age of ~1.7e9 s, which read as a
+        # decades-old snapshot instead of one nobody dated.
+        fetched_at = float(payload.get("fetched_at") or 0.0)
+        if fetched_at <= 0.0:
+            return float("inf")
+        return max(0.0, time.time() - fetched_at)
     except (OSError, ValueError, TypeError, AttributeError):
         return float("inf")
 
@@ -350,21 +356,30 @@ def _row_window(row: dict) -> int:
 def _degraded_models(default_window: int = 0) -> list[dict[str, object]] | None:
     """What to serve when the upstream catalog cannot be read.
 
-    Snapshot first (the real cloud list as last seen), local opencode catalog
-    second, ``None`` last — which lets the caller fall back to the stock
-    kiro-cli handler. The order matters: a stale-but-real list beats an empty
-    one, and both beat KiroCrew's built-in list, which names models this
-    deployment cannot run at all. The snapshot's age goes into the log so a
-    dead-id catalog is never mistaken for a live one.
+    Snapshot first (the real cloud list as last seen, while it is no older than
+    ``_SNAPSHOT_MAX_AGE_SECS``), local opencode catalog second, ``None`` last —
+    which lets the caller fall back to the stock kiro-cli handler. The order
+    matters: a fresh-and-real list beats an empty one, and both beat KiroCrew's
+    built-in list, which names models this deployment cannot run at all. The
+    snapshot's age goes into the log so a dead-id catalog is never mistaken for
+    a live one.
     """
     ids = _read_snapshot()
-    if ids:
+    age_secs = _snapshot_age_secs()
+    if ids and age_secs <= _SNAPSHOT_MAX_AGE_SECS:
         logger.warning(
             "openai_provider: upstream /models unreachable — serving %d cached ids"
             " from %s (age %.1f h)", len(ids), _snapshot_path(),
-            _snapshot_age_secs() / 3600.0,
+            age_secs / 3600.0,
         )
         return _format_models(ids, default_window=default_window)
+    if ids:
+        # An over-age snapshot names models that may no longer exist upstream;
+        # the local catalog at least only lists ids this deployment can ask for.
+        logger.warning(
+            "openai_provider: snapshot too old (%.1f h), falling back to the local"
+            " catalog", age_secs / 3600.0,
+        )
     ids = _local_catalog_ids()
     if ids:
         logger.warning(

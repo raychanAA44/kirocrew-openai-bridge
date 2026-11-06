@@ -424,15 +424,22 @@ def _session_model(session_key: str | None) -> str:
     # second ``dashboard_``.
     stem = slug if slug.startswith("dashboard_") else f"dashboard_{slug}"
     names: list[str] = []
-    for pattern in (f"{stem}.jsonl", f"*{stem}.jsonl"):
-        try:
-            names += [
-                os.path.basename(p)
-                for p in sorted(glob.glob(os.path.join(sessions, pattern)))
-            ]
-        except Exception:  # noqa: BLE001
-            pass
-    names = list(dict.fromkeys(names))
+    # The exact file is this session's own pick: read it before any fuzzy pass.
+    # ``*<stem>.jsonl`` also matches ``<stem>-defer.jsonl``, and one prefix
+    # sibling was enough to make two matches, so the exact answer was thrown
+    # away as "ambiguous" and the caller kept the configured default.
+    if os.path.exists(os.path.join(sessions, f"{stem}.jsonl")):
+        names = [f"{stem}.jsonl"]
+    else:
+        for pattern in (f"{stem}.jsonl", f"*{stem}.jsonl"):
+            try:
+                names += [
+                    os.path.basename(p)
+                    for p in sorted(glob.glob(os.path.join(sessions, pattern)))
+                ]
+            except Exception:  # noqa: BLE001
+                pass
+        names = list(dict.fromkeys(names))
     # A shared prefix (``dashboard_lead`` vs ``dashboard_lead-defer``) would
     # otherwise hand one session another session's model. Ambiguity is refused
     # instead: the caller then keeps the configured default, which is wrong but
