@@ -77,12 +77,30 @@ def test_session_model_reads_the_colon_flattened_file(clean_env, tmp_path, monke
 
 
 def test_session_model_refuses_an_ambiguous_prefix(clean_env, tmp_path, monkeypatch):
-    """A shared prefix must not hand one session another session's pick."""
+    """A shared prefix must not hand one session another session's pick.
+
+    The exact file must be ABSENT here: when ``{stem}.jsonl`` exists it is the
+    only correct answer and wins outright. Ambiguity only matters for the fuzzy
+    phase, so this fixture carries two same-suffix siblings and no exact hit.
+    """
     module = load_hook()
     sessions = _sessions(module, monkeypatch, tmp_path)
-    for name in ("dashboard_lead.jsonl", "x_dashboard_lead.jsonl"):
+    for name in ("x_dashboard_lead.jsonl", "y_dashboard_lead.jsonl"):
         (sessions / name).write_text('{"model": "oc/beam-free"}\n', encoding="utf-8")
     assert module._session_model("dashboard:lead") == ""
+
+
+def test_session_model_prefers_the_exact_file_over_a_sibling(clean_env, tmp_path, monkeypatch):
+    """An exact hit is not ambiguity: it wins even when a sibling also matches."""
+    module = load_hook()
+    sessions = _sessions(module, monkeypatch, tmp_path)
+    (sessions / "dashboard_lead.jsonl").write_text(
+        '{"model": "youzi/gpt-6.1-sol"}\n', encoding="utf-8"
+    )
+    (sessions / "x_dashboard_lead.jsonl").write_text(
+        '{"model": "oc/beam-free"}\n', encoding="utf-8"
+    )
+    assert module._session_model("dashboard:lead") == "youzi/gpt-6.1-sol"
 
 
 def test_session_model_missing_file_is_empty(clean_env, tmp_path, monkeypatch):
