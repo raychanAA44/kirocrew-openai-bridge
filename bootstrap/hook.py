@@ -412,11 +412,33 @@ def _session_model(session_key: str | None) -> str:
     if not session_key:
         return ""
     sessions = os.path.join(os.path.expanduser("~"), ".kiro", "crew", "sessions")
-    names = [f"dashboard_{session_key}.jsonl"]
-    try:
-        names += [os.path.basename(p) for p in glob.glob(os.path.join(sessions, f"*{session_key}*.jsonl"))]
-    except Exception:  # noqa: BLE001
-        pass
+    # KiroCrew names the file after the SLOT KEY with the colon flattened:
+    # ``dashboard:chat-11-1793965845`` -> ``dashboard_chat-11-1793965845.jsonl``.
+    # A colon is illegal in a Windows filename, so the naive
+    # ``dashboard_{session_key}.jsonl`` and a glob containing the colon both
+    # missed every real file and this resolver answered "" for every session —
+    # which sent every sentinel spawn back to the configured default model.
+    slug = session_key.replace(":", "_")
+    # The slot key ALREADY carries the ``dashboard:`` prefix, so the file is
+    # ``dashboard_chat-11-<id>.jsonl``: flatten the colon and do not prepend a
+    # second ``dashboard_``.
+    stem = slug if slug.startswith("dashboard_") else f"dashboard_{slug}"
+    names: list[str] = []
+    for pattern in (f"{stem}.jsonl", f"*{stem}.jsonl"):
+        try:
+            names += [
+                os.path.basename(p)
+                for p in sorted(glob.glob(os.path.join(sessions, pattern)))
+            ]
+        except Exception:  # noqa: BLE001
+            pass
+    names = list(dict.fromkeys(names))
+    # A shared prefix (``dashboard_lead`` vs ``dashboard_lead-defer``) would
+    # otherwise hand one session another session's model. Ambiguity is refused
+    # instead: the caller then keeps the configured default, which is wrong but
+    # never silently someone else's pick.
+    if len(names) > 1:
+        return ""
     for name in names:
         path = os.path.join(sessions, name)
         try:

@@ -59,6 +59,12 @@ _SNAPSHOT_NAME = "models_snapshot.json"
 _MODELS_MEMO: tuple[float, list] = (0.0, [])
 _MODELS_MEMO_TTL = 60.0
 
+#: A snapshot older than this is not trusted to pre-seed the memo. The catalog
+#: is operator-managed, so an hours-old list can name models that were retired
+#: since — and the dashboard would offer those dead ids for the first minute
+#: after a restart while the live list already knew better.
+_SNAPSHOT_MAX_AGE_SECS = 3600.0
+
 
 def install(
     *,
@@ -221,6 +227,7 @@ def install(
     try:
         _patch_api_models_fallback(
             cfg["base_url"], cfg["api_key"], cfg.get("fallback_base_url", ""),
+            default_window=int(cfg.get("context_window") or 0),
         )
     except Exception as exc:
         logger.warning("openai_provider: /api/models fallback patch skipped: %s", exc)
@@ -254,6 +261,16 @@ def _read_snapshot() -> list[str]:
     return [str(i).strip() for i in ids if isinstance(i, str) and str(i).strip()]
 
 
+def _snapshot_age_secs() -> float:
+    """Age of the cached catalog, ``inf`` when unknown or unreadable."""
+    try:
+        with open(_snapshot_path(), encoding="utf-8") as fh:
+            payload = json.load(fh)
+        return max(0.0, time.time() - float(payload.get("fetched_at") or 0.0))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return float("inf")
+
+
 def _write_snapshot(ids: list[str]) -> None:
     """Best-effort persist of a successful answer; never raises into a handler."""
     path = _snapshot_path()
@@ -283,7 +300,7 @@ def _local_catalog_ids() -> list[str]:
 
 
 def _format_models(
-    ids: list[str], windows: dict[str, int] | None = None,
+    ids: list[str], windows: dict[str, int] | None = None, default_window: int = 0,
 ) -> list[dict[str, object]]:
     """KiroCrew's ``/api/models`` row shape for BARE upstream model ids.
 
@@ -291,7 +308,9 @@ def _format_models(
     ``model_registry.model_window`` knows nothing about these provider ids and
     answered 0 for all nine, which made the dashboard's context meter read 0 %
     on every model. The registry still wins when it knows the id (it is the
-    project's single source of truth); the advertised number is the fallback.
+    project's single source of truth); the advertised number is the fallback,
+    and ``default_window`` (the provider's configured context window) is the
+    last resort so a newly added upstream id never renders as a 0-token model.
     """
     from kiro_crew import model_registry
 
@@ -303,7 +322,8 @@ def _format_models(
                 "model_name": mid,
                 "description": "",
                 "context_window_tokens": model_registry.model_window(mid)
-                or int(windows.get(mid) or 0),
+                or int(windows.get(mid) or 0)
+                or int(default_window or 0),
                 "rate_multiplier": 1.0,
             }
         )
@@ -327,35 +347,38 @@ def _row_window(row: dict) -> int:
     return 0
 
 
-def _degraded_models() -> list[dict[str, object]] | None:
+def _degraded_models(default_window: int = 0) -> list[dict[str, object]] | None:
     """What to serve when the upstream catalog cannot be read.
 
     Snapshot first (the real cloud list as last seen), local opencode catalog
     second, ``None`` last — which lets the caller fall back to the stock
     kiro-cli handler. The order matters: a stale-but-real list beats an empty
     one, and both beat KiroCrew's built-in list, which names models this
-    deployment cannot run at all.
+    deployment cannot run at all. The snapshot's age goes into the log so a
+    dead-id catalog is never mistaken for a live one.
     """
     ids = _read_snapshot()
     if ids:
         logger.warning(
             "openai_provider: upstream /models unreachable — serving %d cached ids"
-            " from %s", len(ids), _snapshot_path(),
+            " from %s (age %.1f h)", len(ids), _snapshot_path(),
+            _snapshot_age_secs() / 3600.0,
         )
-        return _format_models(ids)
+        return _format_models(ids, default_window=default_window)
     ids = _local_catalog_ids()
     if ids:
         logger.warning(
             "openai_provider: upstream /models unreachable and no snapshot — serving"
             " %d ids from the local opencode catalog", len(ids),
         )
-        return _format_models(ids)
+        return _format_models(ids, default_window=default_window)
     logger.warning("openai_provider: no upstream, no snapshot, no local catalog")
     return None
 
 
 async def _fetch_upstream_models(
     base_url: str, api_key: str, fallback_base_url: str = "",
+    default_window: int = 0,
 ) -> list[dict[str, object]] | None:
     """Fetch and format models from the upstream OpenAI-compatible ``/v1/models``.
 
@@ -418,12 +441,15 @@ async def _fetch_upstream_models(
             "openai_provider: upstream /models returned %d models from %s",
             len(ids), endpoint,
         )
-        return _format_models(ids, windows)
+        return _format_models(ids, windows, default_window=default_window)
 
-    return _degraded_models()
+    return _degraded_models(default_window=default_window)
 
 
-def _patch_api_models_fallback(base_url: str, api_key: str, fallback_base_url: str = "") -> None:
+def _patch_api_models_fallback(
+    base_url: str, api_key: str, fallback_base_url: str = "",
+    default_window: int = 0,
+) -> None:
     """Replace ``/api/models`` with an upstream-first model catalog.
 
     Queries the upstream OpenAI-compatible ``/v1/models`` endpoint.  If
@@ -448,7 +474,9 @@ def _patch_api_models_fallback(base_url: str, api_key: str, fallback_base_url: s
             return web.json_response(cached)
 
         # Try upstream first — it's the authoritative source.
-        models = await _fetch_upstream_models(base_url, api_key, fallback_base_url)
+        models = await _fetch_upstream_models(
+            base_url, api_key, fallback_base_url, default_window=default_window,
+        )
         if models is not None:
             _MODELS_MEMO = (time.time(), models)
             return web.json_response(models)
@@ -471,11 +499,14 @@ def _patch_api_models_fallback(base_url: str, api_key: str, fallback_base_url: s
     # Seed the memo from the snapshot: the first dashboard refresh after a start
     # used to pay the whole cold path (measured 4.9 s while the gateway was still
     # restoring memory), and the answer it finally produced was a list the disk
-    # already knew. The snapshot is that same list.
+    # already knew. The snapshot is that same list — but only while it is still
+    # young enough to be the same list; a stale one seeds dead model ids into the
+    # picker for the whole first minute, so an old snapshot is left on disk and
+    # simply not trusted here.
     global _MODELS_MEMO
     _seed = _read_snapshot()
-    if _seed:
-        _MODELS_MEMO = (time.time(), _format_models(_seed))
+    if _seed and _snapshot_age_secs() <= _SNAPSHOT_MAX_AGE_SECS:
+        _MODELS_MEMO = (time.time(), _format_models(_seed, default_window=default_window))
 
     _agents_mod.api_models = _api_models_with_upstream  # type: ignore[assignment]
     import kiro_crew.dashboard.handlers as _handlers_pkg
