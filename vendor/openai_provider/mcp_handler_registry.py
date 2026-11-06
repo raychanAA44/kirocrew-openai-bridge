@@ -27,6 +27,31 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def _kill_child(proc: Any) -> None:
+    """End a spawned child AND everything it spawned.
+
+    ``proc.kill()`` is one handle: on Windows ``create_subprocess_shell`` runs
+    ``cmd /c``, whose children are re-parented and keep running after cmd dies.
+    A cancelled or timed-out tool therefore reported "terminated" while the real
+    work survived, so kill the tree, not the shell.
+    """
+    if proc is None or proc.returncode is not None:
+        return
+    try:
+        if os.name == "nt":
+            import subprocess
+
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=10, check=False,
+            )
+        else:
+            proc.kill()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # ── Base Handler ─────────────────────────────────────────────────────────────
 
 class McpHandler(ABC):
@@ -181,6 +206,7 @@ class BashHandler(McpHandler):
     async def execute(self, args: dict) -> str:
         cmd = args.get("command", "")
         if not cmd: return "[Error: command required]"
+        proc = None
         try:
             proc = await asyncio.create_subprocess_shell(
                 cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
@@ -189,6 +215,8 @@ class BashHandler(McpHandler):
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
         except asyncio.TimeoutError:
             return f"[timed out after 30s: {cmd[:200]}]"
+        finally:
+            _kill_child(proc)
         out = _decode_child(stdout)
         err = _decode_child(stderr)
         if err: out += f"\n[stderr]\n{err}"
@@ -288,6 +316,7 @@ class GrepHandler(McpHandler):
         if args.get("include"): cmd.extend(["--include", args["include"]])
         if args.get("exclude"): cmd.extend(["--exclude", args["exclude"]])
         cmd.extend([pattern, directory])
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=_child_shell_env())
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
@@ -296,6 +325,7 @@ class GrepHandler(McpHandler):
             if len(out) > 30000: out = "\n".join(out.splitlines()[:500]) + "\n...(truncated)"
             return out or f"[No matches]"
         except asyncio.TimeoutError: return "[grep timed out]"
+        finally: _kill_child(proc)
 
 
 class GlobHandler(McpHandler):
@@ -327,6 +357,7 @@ class FindHandler(McpHandler):
         cmd = ["find", args.get("path") or ".", "-maxdepth", "5"]
         if args.get("name"): cmd.extend(["-name", args["name"]])
         if args.get("type") in ("f", "d"): cmd.extend(["-type", args["type"]])
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=_child_shell_env())
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
@@ -336,6 +367,7 @@ class FindHandler(McpHandler):
             if len(lines) > 200: return "\n".join(lines[:200]) + f"\n... ({len(lines)} total)"
             return out
         except asyncio.TimeoutError: return "[find timed out]"
+        finally: _kill_child(proc)
 
 
 class ListDirHandler(McpHandler):
@@ -371,6 +403,7 @@ class WebFetchHandler(McpHandler):
         url = args.get("url", "")
         if not url: return "[Error: url required]"
         max_len = args.get("maxLength") or args.get("max_length") or 50000
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec("curl", "-sL", "-A", "Mozilla/5.0 (KiroCrew/1.0)", "--max-time", "30", "-o", "-", url, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=35.0)
@@ -379,6 +412,7 @@ class WebFetchHandler(McpHandler):
             if len(content) > max_len: content = content[:max_len] + f"\n...(truncated at {max_len})"
             return content
         except asyncio.TimeoutError: return f"[Fetch timed out: {url}]"
+        finally: _kill_child(proc)
 
 
 class WebSearchHandler(McpHandler):
