@@ -95,7 +95,7 @@ if [ "$DRY_RUN" = "1" ]; then
   echo "   would populate $INSTALL_DIR"
 else
   mkdir -p "$INSTALL_DIR"
-  cp "$HERE/bootstrap/hook.py" "$HERE/bootstrap/provider_config.py" "$INSTALL_DIR/"
+  cp "$HERE/bootstrap/hook.py" "$HERE/bootstrap/provider_config.py" "$HERE/bootstrap/effort_picker.py" "$INSTALL_DIR/"
   rm -rf "$INSTALL_DIR/openai_provider"
   cp -r "$HERE/vendor/openai_provider" "$INSTALL_DIR/"
   echo "   populated $INSTALL_DIR"

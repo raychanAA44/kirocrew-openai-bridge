@@ -98,6 +98,7 @@ else {
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
     Copy-Item (Join-Path $here 'bootstrap\hook.py') $InstallDir -Force
     Copy-Item (Join-Path $here 'bootstrap\provider_config.py') $InstallDir -Force
+    Copy-Item (Join-Path $here 'bootstrap\effort_picker.py') $InstallDir -Force
     Copy-Item (Join-Path $here 'vendor\openai_provider') $InstallDir -Recurse -Force
     Say "   populated $InstallDir"
 }
