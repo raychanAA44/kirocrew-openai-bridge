@@ -136,7 +136,32 @@ def _main() -> None:
     _patch_effort_reapply()
     _patch_factory_model()
     _patch_bg_session()
+    _apply_effort_picker_patch()
     _prewarm_upstream(cfg)
+
+
+def _apply_effort_picker_patch() -> None:
+    """Re-apply the settings-page effort-picker patch, once per crew start.
+
+    A crew upgrade replaces ``static/dist`` wholesale, so the patched predicate
+    comes back unpatched. Running it here (idempotent, and it refuses a bundle it
+    does not recognise instead of guessing) means an upgrade self-heals at the
+    next start rather than waiting for someone to remember this script. Never
+    fatal: a UI dropdown is not worth failing the gateway over.
+    """
+    try:
+        import importlib
+
+        effort_picker = importlib.import_module("effort_picker")
+    except Exception as exc:  # noqa: BLE001
+        _log(f"effort-picker patch skipped: {type(exc).__name__}: {exc}")
+        return
+    try:
+        action, before, after = effort_picker.apply()
+    except Exception as exc:  # noqa: BLE001
+        _log(f"effort-picker patch failed: {type(exc).__name__}: {exc}")
+        return
+    _log(f"effort-picker patch: {action} ({before} -> {after})")
 
 
 def _patch_live_effort() -> None:
